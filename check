@@ -1,0 +1,115 @@
+## Create SR-IOV Operator Namespace
+## sr-iov-ns.yaml
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: openshift-sriov-network-operator
+  annotations:
+    workload.openshift.io/allowed: management
+
+
+## Create SR-IOV Operator Group
+## sr-iov-opgrp.yaml
+---
+apiVersion: operators.coreos.com/v1
+kind: OperatorGroup
+metadata:
+  name: sriov-network-operators
+  namespace: openshift-sriov-network-operator
+spec:
+  targetNamespaces:
+    - openshift-sriov-network-operator
+
+
+## Create a Subscription for the SR-IOV Operator
+
+## To-do
+## Run the following command to get the OpenShift Container Platform major and minor version
+## oc version -o yaml | grep openshiftVersion | grep -o '[0-9]*[.][0-9]*' | head -1
+## Replace ${OC_VERSION} in the manifest below with the OCP version from the command output
+
+## sr-iov-opsub.yaml
+---
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: sriov-network-operator-subscription
+  namespace: openshift-sriov-network-operator
+spec:
+  channel: "4.12"
+  name: sriov-network-operator
+  source: redhat-operators
+  sourceNamespace: openshift-marketplace
+
+
+## To verify that the Operator installed successfully, run:
+oc get csv -n openshift-sriov-network-operator -o custom-columns=Name:.metadata.name,Phase:.status.phase
+
+
+## To allow us create a Network Node Policy for the Solarflare NIC, run the command below to patch the SR-IOV Operator config
+oc patch sriovoperatorconfig default --type=merge \
+  -n openshift-sriov-network-operator \
+  --patch '{ "spec": { "enableOperatorWebhook": false } }'
+
+## To target the SR-IOV Network Config daemon to run only on the worker nodes with the Solarflare NICs, run:
+oc patch sriovoperatorconfig default --type=json \
+  -n openshift-sriov-network-operator \
+  --patch '[{
+      "op": "replace",
+      "path": "/spec/configDaemonNodeSelector",
+      "kubernetes.io/hostname": worker3.ocp-test.corp.tdsecurities.com
+    }]'
+
+
+## Create an SR-IOV Network Node Policy that will configure the SR-IOV network device
+## First, we label the worker node that has the Solarflare installed
+oc label node/worker3.ocp-test.corp.tdsecurities.com feature.node.kubernetes.io/network-sriov.capable="true"
+
+
+## sr-iov-netnodepolicy.yaml
+---
+apiVersion: sriovnetwork.openshift.io/v1
+kind: SriovNetworkNodePolicy
+metadata:
+  name: sriov-solarflare-nnpolicy
+  namespace: openshift-sriov-network-operator
+spec:
+  resourceName: solarflarenic1
+  nodeSelector:
+    feature.node.kubernetes.io/network-sriov.capable: "true"
+  numVfs: 4
+  nicSelector:
+    pfNames: ['ens3f0']
+  deviceType: netdevice
+
+
+## Create an SR-ION Network object that targets the application namespace where the NAD should be created
+## sr-iov-pubsubtest-nad.yaml
+---
+apiVersion: sriovnetwork.openshift.io/v1
+kind: SriovNetwork
+metadata:
+  name: sriov-onload-server-nad
+  namespace: openshift-sriov-network-operator 
+spec:
+  resourceName: solarflarenic1
+  networkNamespace: default
+  linkState: enable
+  vlan: 304
+  ipam: |
+    {
+      "type": "static",
+        "addresses": [
+          {
+            "address": "10.225.56.125/27",
+            "gateway": "10.225.56.197"
+          }
+        ],
+      "routes": [
+        {
+          "dst": "0.0.0.0/0",
+          "gw": "10.225.56.197"
+        }
+      ]
+    }
