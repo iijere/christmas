@@ -1,5 +1,6 @@
 ## Ho! Ho!! Ho!!!
 
+```bash
 .
 ├── placements
 │   ├── base
@@ -34,3 +35,4 @@
     │   └── kustomization.yaml
     └── staging
         └── kustomization.yaml
+```
