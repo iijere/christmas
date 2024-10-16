@@ -1,3 +1,4 @@
+```yaml
 apiVersion: policy.open-cluster-management.io/v1
 kind: Policy
 metadata:
@@ -46,3 +47,4 @@ spec:
                   name: cluster-owner
           remediationAction: enforce
           severity: low
+```
