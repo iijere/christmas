@@ -22,3 +22,30 @@ def _process_cluster_statuses(self, policy_name: str, status: Dict, namespace: s
                 'cluster_namespace': cluster_ns
             }
     return cluster_status
+
+
+def get_cluster_compliance(self, namespace: str) -> Dict:
+    """Get compliance status for all policies in namespace"""
+    try:
+        policies = self._get_policies(namespace)
+        compliance_data = {}
+        
+        for policy in policies:
+            policy_name = policy.get('metadata', {}).get('name')
+            if not policy_name:
+                continue
+            
+            status = policy.get('status', {})
+            cluster_statuses = self._process_cluster_statuses(policy_name, status, namespace)  # Pass namespace here
+            
+            compliance_data[policy_name] = {
+                'overall_compliance': status.get('compliant', 'Unknown'),
+                'cluster_status': cluster_statuses,
+                'timestamp': datetime.now().isoformat(),
+                'details': self._get_policy_details(policy)
+            }
+        
+        return compliance_data
+    except Exception as e:
+        self.logger.error(f"Failed to get policy compliance: {e}")
+        raise
