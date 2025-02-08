@@ -1,498 +1,417 @@
-#!/usr/bin/env python3
-
-DOCUMENTATION = r'''
----
-module: rhacm_policy_validator
-short_description: Validates RHACM policies across Prime clusters
-version_added: "1.0.0"
-description:
-    - Module for validating the compliance status of Red Hat Advanced Cluster Management (RHACM) policies across multiple prime clusters
-    - Captures policy compliance state before and after RHACM policy release
-    - Generates detailed reports highlighting policy changes and violations
-    - Provides consolidated view of non-compliant policies across all prime clusters
-
-options:
-    hub_configs:
-        description:
-            - List of prime cluster configurations
-        required: true
-        type: list
-        elements: dict
-        suboptions:
-            name:
-                description: Name identifier for the prime cluster, example:
-                required: true
-                type: str
-            kubeconfig:
-                description: Path to the kubeconfig file for prime cluster
-                required: true
-                type: str
-    
-    namespaces:
-        description:
-            - List of namespaces to monitor for policies
-        required: true
-        type: list
-        elements: str
-    
-    state:
-        description:
-            - Determines whether to capture pre-deployment or post-deployment state
-            - 'pre' captures initial policy state before policy release
-            - 'post' captures final policy state after release, and generates comparison report
-        required: true
-        type: str
-        choices: ['pre', 'post']
-    
-    state_file:
-        description:
-            - Path to store/retrieve the pre-deployment state data
-        required: true
-        type: str
-    
-    wait_time:
-        description:
-            - Time in seconds to wait before capturing post-deployment state
-            - Allows policies to stabilize after changes
-        required: false
-        type: int
-        default: 300
-
-requirements:
-    - kubernetes >= 12.0.0
-    - PyYAML >= 5.1
-    - jmespath
-    - requests
-
-attributes:
-    check_mode:
-        support: none
-    diff_mode:
-        support: none
-
-author:
-    - "iijere@redhat.com"
-
-notes:
-    - This module requires appropriate RBAC permissions to access RHACM policies
-    - Kubeconfig files must have necessary credentials for prime cluster access
-    - Pre-deployment state is stored as JSON in the specified state file
-    - Generated report includes both policy changes and current non-compliant state
-
-example_output_dict:
-    changed:
-        description: Indicates if any policies became non-compliant
-        type: bool
-        example: true
-    compliance_state:
-        description: Current state of all policies across hub clusters
-        type: dict
-    comparison:
-        description: Comparison between pre and post states
-        type: dict
-        contains:
-            summary:
-                description: Statistical overview of policy states
-                type: dict
-                contains:
-                    total_hubs: Number of hub clusters monitored
-                    total_policies: Total number of policies across all hubs
-                    compliant: Number of compliant policies
-                    total_noncompliant: Number of non-compliant policies
-                    newly_noncompliant: Number of policies that became non-compliant
-                    newly_compliant: Number of policies that became compliant
-                    changed: Total number of policies that changed state
-            consolidated_view:
-                description: Detailed view of policy changes and current state
-                type: dict
-
-examples:
-    - name: Capture pre-deployment policy state
-      rhacm_policy_validator:
-        hub_configs:
-            - name: prime1.
-              kubeconfig: /path/to/prime1.kubeconfig
-            - name: prime2
-              kubeconfig: /path/to/prime2.kubeconfig
-        namespaces:
-            - policies
-            - rhacm-prod
-        state: pre
-        state_file: /tmp/pre_deployment_state.json
-
-    - name: Validate post-deployment policy state
-      rhacm_policy_validator:
-        hub_configs:
-            - name: prime1.
-              kubeconfig: /path/to/prime1.kubeconfig
-            - name: prime2
-              kubeconfig: /path/to/prime2.kubeconfig
-        namespaces:
-            - policies
-            - rhacm-prod
-        state: post
-        state_file: /tmp/pre_deployment_state.json
-        wait_time: 300
-
-    - name: Generate HTML report with policy validation results
-      template:
-        src: policy-release-report.j2
-        dest: /path/to/policy-release-report.html
-      vars:
-        comparison: "{{ validation_result.comparison }}"
-        compliance_state: "{{ validation_result.compliance_state }}"
-
-report_sections:
-    header:
-        description: Displays total hub clusters and non-compliant managed clusters
-    
-    dashboard:
-        description: Visual overview of policy compliance
-        contains:
-            - Donut chart showing compliance distribution
-            - Bar chart showing non-compliant policies by hub
-            - Summary statistics cards
-    
-    policy_changes:
-        description: Lists policies that changed compliance status
-        features:
-            - Color-coded cards (red for non-compliant, green for compliant)
-            - Policy details and remediation actions
-            - Affected clusters and console links
-    
-    all_non_compliant:
-        description: Groups all currently non-compliant policies
-        features:
-            - Policies grouped by name across hubs
-            - Per-hub violation details
-            - Console links for detailed investigation
-
-notes_on_html_report:
-    - Uses TailwindCSS for styling
-    - Includes Charts.js for visualizations
-    - Responsive design for various screen sizes
-    - Interactive elements like hover states and console links
-'''
-
-from ansible.module_utils.basic import AnsibleModule
-from datetime import datetime
-from kubernetes import client, config
-from typing import Dict, List, Optional
-import logging
-import json
-import time
-import concurrent.futures
-
-class ConsoleURLBuilder:
-    """Generates RHACM console URLs for policy viewing"""
-    def __init__(self, custom_api: client.CustomObjectsApi, hub_name: str):
-        self.hub_name = hub_name
-        self.custom_api = custom_api
-        self._console_host = None
-
-    def get_console_host(self) -> Optional[str]:
-        """Get and cache the console route host"""
-        if not self._console_host:
-            try:
-                route = self.custom_api.get_namespaced_custom_object(
-                    group="route.openshift.io",
-                    version="v1",
-                    namespace="openshift-console",
-                    plural="routes",
-                    name="console"
-                )
-                self._console_host = route.get('spec', {}).get('host')
-            except Exception as e:
-                logging.error(f"Failed to get console route: {e}")
-        return self._console_host
-
-    def get_policy_url(self, policy_name: str, namespace: str) -> Optional[str]:
-        """Generate policy-specific console URL"""
-        host = self.get_console_host()
-        if host:
-            return f"https://{host}/multicloud/governance/policies/details/{namespace}/{policy_name}/results"
-        return None
-
-class PolicyValidator:
-    """Handles policy validation for a single hub cluster"""
-    def __init__(self, kubeconfig: str, hub_name: str):
-        self.hub_name = hub_name
-        config.load_kube_config(kubeconfig)
-        self.custom_api = client.CustomObjectsApi()
-        self.url_builder = ConsoleURLBuilder(self.custom_api, hub_name)
-
-    def get_policies(self, namespace: str) -> Dict:
-        """Get current policy compliance status"""
-        try:
-            policies = self.custom_api.list_namespaced_custom_object(
-                group="policy.open-cluster-management.io",
-                version="v1",
-                namespace=namespace,
-                plural="policies"
-            ).get('items', [])
-
-            compliance_data = {}
-            for policy in policies:
-                policy_name = policy.get('metadata', {}).get('name')
-                if not policy_name:
-                    continue
-
-                status = policy.get('status', {})
-                compliance_status = status.get('compliant')
-                
-                # Store ALL policies, not just non-compliant ones
-                compliance_data[policy_name] = {
-                    'overall_compliance': compliance_status,
-                    'cluster_status': self._get_cluster_status(policy_name, status, namespace) if compliance_status == 'NonCompliant' else {},
-                    'namespace': namespace,
-                    'details': self._get_policy_details(policy)
-                }
-
-            return compliance_data
-        except Exception as e:
-            logging.error(f"Failed to get policies: {e}")
-            raise
-
-    def _get_cluster_status(self, policy_name: str, status: Dict, namespace: str) -> Dict:
-        """Process cluster-specific compliance status"""
-        cluster_status = {}
-        console_url = self.url_builder.get_policy_url(policy_name, namespace)
-
-        for cluster_info in status.get('status', []):
-            cluster_name = cluster_info.get('clustername')
-            if cluster_name and cluster_info.get('compliant') == 'NonCompliant':
-                cluster_status[cluster_name] = {
-                    'compliant': 'NonCompliant',
-                    'console_url': console_url
-                }
-        return cluster_status
-
-    def _get_policy_details(self, policy: Dict) -> Dict:
-        """Extract relevant policy details"""
-        metadata = policy.get('metadata', {})
-        spec = policy.get('spec', {})
-        templates = spec.get('policy-templates', [])
-        
-        remediation = 'inform'
-        if templates:
-            remediation = templates[0].get('objectDefinition', {}).get('spec', {}).get('remediationAction', 'inform')
-        
-        return {
-            'name': metadata.get('name', 'unknown'),
-            'remediation_action': remediation,
-            'description': spec.get('description', '')
-        }
-
-class MultiHubValidator:
-    """Orchestrates policy validation across multiple hubs"""
-    def __init__(self, hub_configs: List[Dict[str, str]]):
-        self.validators = {}
-        for config in hub_configs:
-            try:
-                validator = PolicyValidator(
-                    kubeconfig=config['kubeconfig'],
-                    hub_name=config['name']
-                )
-                self.validators[config['name']] = validator
-            except Exception as e:
-                logging.error(f"Failed to initialize hub {config['name']}: {e}")
-
-    def get_compliance_state(self, namespaces: List[str]) -> Dict:
-        """Get non-compliant policies from all hubs"""
-        hub_data = {}
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            futures = []
-            for hub_name, validator in self.validators.items():
-                for namespace in namespaces:
-                    future = executor.submit(validator.get_policies, namespace)
-                    futures.append((hub_name, namespace, future))
-
-            for hub_name, namespace, future in futures:
-                try:
-                    if hub_name not in hub_data:
-                        hub_data[hub_name] = {}
-                    hub_data[hub_name].update(future.result())
-                except Exception as e:
-                    logging.error(f"Error getting compliance for {hub_name}: {e}")
-
-        return hub_data
-
-    def generate_report(self, pre_state: Dict, post_state: Dict) -> Dict:
-        """Generate comparison report between states"""
-        return {
-            'summary': self._generate_summary(pre_state, post_state),
-            'consolidated_view': self._generate_consolidated_view(pre_state, post_state)
-        }
-
-    def _generate_summary(self, pre_state: Dict, post_state: Dict) -> Dict:
-        """Generate overall summary statistics"""
-        total_policies = 0
-        total_compliant = 0
-        total_noncompliant = 0
-        policies_became_noncompliant = set()
-        policies_became_compliant = set()
-        noncompliant_by_hub = {}
-        seen_policies = set()
-        
-        # Use a set of tuples (hub_name, cluster_name) instead of just cluster_name
-        noncompliant_managed_clusters = set()
-        
-        # Process each hub's policies
-        for hub_name, hub_policies in post_state.items():
-            hub_noncompliant = 0
-            pre_hub_state = pre_state.get(hub_name, {})
-            
-            for policy_name, policy in hub_policies.items():
-                # Only count unique policies
-                policy_key = (policy_name, policy.get('namespace', ''))
-                if policy_key not in seen_policies:
-                    seen_policies.add(policy_key)
-                    total_policies += 1
-                    
-                    # Count compliant vs non-compliant
-                    if policy.get('overall_compliance') == 'NonCompliant':
-                        total_noncompliant += 1
-                        # Track non-compliant managed clusters with hub context
-                        cluster_status = policy.get('cluster_status', {})
-                        for cluster_name in cluster_status.keys():
-                            noncompliant_managed_clusters.add((hub_name, cluster_name))
-                    elif policy.get('overall_compliance') == 'Compliant':
-                        total_compliant += 1
-
-                # Track non-compliant policies per hub
-                if policy.get('overall_compliance') == 'NonCompliant':
-                    hub_noncompliant += 1
-
-                # Check for policy status changes
-                pre_policy = pre_hub_state.get(policy_name, {})
-                if pre_policy:
-                    pre_compliance = pre_policy.get('overall_compliance')
-                    post_compliance = policy.get('overall_compliance')
-                    if pre_compliance != post_compliance:
-                        if post_compliance == 'NonCompliant':
-                            policies_became_noncompliant.add(policy_key)
-                        elif post_compliance == 'Compliant':
-                            policies_became_compliant.add(policy_key)
-
-            noncompliant_by_hub[hub_name] = hub_noncompliant
-
-        return {
-            'total_hubs': len(post_state),
-            'total_noncompliant_clusters': len(noncompliant_managed_clusters),  # Now counts unique hub+cluster combinations
-            'total_policies': total_policies,
-            'compliant': total_compliant,
-            'total_noncompliant': total_noncompliant,
-            'newly_noncompliant': len(policies_became_noncompliant),
-            'newly_compliant': len(policies_became_compliant),
-            'changed': len(policies_became_noncompliant) + len(policies_became_compliant),
-            'cluster_names': list(noncompliant_by_hub.keys()),
-            'cluster_noncompliant': list(noncompliant_by_hub.values())
-        }
-
-    def _generate_consolidated_view(self, pre_state: Dict, post_state: Dict) -> Dict:
-        """Generate consolidated view of policy changes"""
-        policies = {}
-        namespaces = set()
-        
-        for hub_name, hub_policies in post_state.items():
-            pre_hub_state = pre_state.get(hub_name, {})
-            
-            for policy_name, policy in hub_policies.items():
-                hub_namespace = policy['namespace']
-                namespaces.add(hub_namespace)
-                
-                pre_policy = pre_hub_state.get(policy_name, {})
-                pre_compliance = pre_policy.get('overall_compliance')
-                post_compliance = policy.get('overall_compliance')
-                
-                # Track both newly non-compliant and newly compliant policies
-                if pre_compliance != post_compliance:
-                    if policy_name not in policies:
-                        policies[policy_name] = {
-                            'details': policy['details'],
-                            'violation_count': 0,
-                            'status_change': 'became_noncompliant' if post_compliance == 'NonCompliant' else 'became_compliant',
-                            'hubs': {}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RHACM Policy Report</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/3.9.1/chart.min.js"></script>
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    colors: {
+                        brand: {
+                            blue: '#004B87',
+                            lightblue: '#E5EEF4',
+                            gray: '#58595B',
+                            lightgray: '#F4F4F4'
                         }
-
-                    # Add hub-specific information
-                    policies[policy_name]['hubs'][hub_name] = {
-                        'namespace': hub_namespace,
-                        'previous_status': pre_compliance,
-                        'current_status': post_compliance,
-                        'noncompliant_clusters': (
-                            [
-                                {'cluster': cluster, 'console_url': data['console_url']}
-                                for cluster, data in policy['cluster_status'].items()
-                            ] if post_compliance == 'NonCompliant' else []
-                        )
                     }
-                    
-                    if post_compliance == 'NonCompliant':
-                        policies[policy_name]['violation_count'] += len(
-                            policies[policy_name]['hubs'][hub_name]['noncompliant_clusters']
-                        )
-
-        return {
-            'policies': policies,
-            'namespaces': sorted(list(namespaces))
+                }
+            }
         }
+    </script>
+    <style>
+        .policy-card {
+            transition: transform 0.2s ease-in-out;
+        }
+        .policy-card:hover {
+            transform: translateY(-2px);
+        }
+        .status-badge {
+            @apply px-3 py-1 text-xs font-semibold rounded-full;
+        }
+        .status-badge.became-noncompliant {
+            @apply bg-red-100 text-red-800;
+        }
+        .status-badge.became-compliant {
+            @apply bg-green-100 text-green-800;
+        }
+    </style>
+</head>
+<body class="bg-brand-lightgray min-h-screen">
+    
+    <!-- Fixed Header -->
+    <nav class="bg-brand-blue shadow fixed w-full z-10">
+        <div class="max-w-7xl mx-auto px-4">
+            <div class="flex justify-between h-16">
+                <div class="flex items-center">
+                    <h1 class="text-xl font-bold text-white">RHACM Policy Report</h1>
+                </div>
+                <div class="flex items-center space-x-4">
+                    <div class="px-3 py-2 rounded-lg bg-white/10">
+                        <span class="text-white text-sm">
+                            Prime Clusters: <span class="font-bold">{{ comparison.summary.total_hubs|default(0) }}</span>
+                        </span>
+                    </div>
+                    <div class="px-3 py-2 rounded-lg bg-red-500/20">
+                        <span class="text-white text-sm">
+                            Managed Clusters: <span class="font-bold">{{ comparison.summary.total_noncompliant_clusters|default(0) }}</span>
+                        </span>
+                    </div>
+                    <span class="text-gray-300 text-sm">{{ date_time }}</span>
+                </div>
+            </div>
+        </div>
+    </nav>
 
-    def _count_new_noncompliant(self, pre_state: Dict, post_state: Dict) -> int:
-        """Count newly non-compliant policies"""
-        count = 0
-        for hub_name, hub_policies in post_state.items():
-            pre_hub = pre_state.get(hub_name, {})
-            for policy_name in hub_policies:
-                if (policy_name not in pre_hub or
-                    pre_hub[policy_name].get('overall_compliance') != 'NonCompliant'):
-                    count += 1
-        return count
+    <!-- Main Content -->
+    <div class="pt-20">
+        <div class="max-w-7xl mx-auto px-4">
 
-def main():
-    module = AnsibleModule(
-        argument_spec=dict(
-            hub_configs=dict(type='list', required=True, elements='dict'),
-            namespaces=dict(type='list', required=True, elements='str'),
-            state=dict(type='str', required=True, choices=['pre', 'post']),
-            state_file=dict(type='str', required=True),
-            wait_time=dict(type='int', default=300)
-        )
-    )
+        <!-- Dashboard -->
+        <div class="mb-8">
+            <!-- Charts Grid -->
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-6 my-8">
+                <!-- Donut Chart -->
+                <div class="bg-white rounded-lg shadow">
+                    <div class="p-4 border-b border-gray-200">
+                        <h3 class="text-lg font-medium text-gray-900">Policy Compliance Overview</h3>
+                    </div>
+                    <div class="p-4">
+                        <div class="relative" style="height: 280px;">
+                            <canvas id="complianceChart"></canvas>
+                        </div>
+                    </div>
+                </div>
+                
+                <!-- Bar Chart -->
+                <div class="bg-white rounded-lg shadow">
+                    <div class="p-4 border-b border-gray-200">
+                        <h3 class="text-lg font-medium text-gray-900">Non-Compliant Policies by Prime Cluster</h3>
+                    </div>
+                    <div class="p-4">
+                        <div class="relative" style="height: 280px;">
+                            <canvas id="clusterChart"></canvas>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Stats Cards -->
+            <div class="grid grid-cols-2 md:grid-cols-4 gap-6">
+                <div class="bg-white rounded-lg shadow p-4">
+                    <div class="text-sm text-gray-600 mb-1">Total Policies</div>
+                    <div class="text-2xl font-semibold text-brand-blue">{{ comparison.summary.total_policies|default(0) }}</div>
+                </div>
+                <div class="bg-white rounded-lg shadow p-4">
+                    <div class="text-sm text-gray-600 mb-1">Compliant</div>
+                    <div class="text-2xl font-semibold text-green-600">{{ comparison.summary.compliant|default(0) }}</div>
+                </div>
+                <div class="bg-white rounded-lg shadow p-4">
+                    <div class="text-sm text-gray-600 mb-1">Non-Compliant</div>
+                    <div class="text-2xl font-semibold text-red-600">{{ comparison.summary.total_noncompliant|default(0) }}</div>
+                </div>
+                <div class="bg-white rounded-lg shadow p-4">
+                    <div class="text-sm text-gray-600 mb-1">Changed</div>
+                    <div class="text-2xl font-semibold text-yellow-600">{{ comparison.summary.changed|default(0) }}</div>
+                </div>
+            </div>
+        </div>
 
-    try:
-        validator = MultiHubValidator(module.params['hub_configs'])
-        result = {'changed': False}
+        <!-- Policy Changes Section -->
+        <div class="bg-white rounded-lg shadow mb-8">
+            <div class="px-6 py-4 border-b border-gray-200">
+                <h3 class="text-lg font-medium text-gray-900 flex items-center">
+                    <svg class="w-5 h-5 mr-2 text-yellow-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" 
+                            d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/>
+                    </svg>
+                    Policy Changes
+                </h3>
+            </div>
 
-        if module.params['state'] == 'pre':
-            result['compliance_state'] = validator.get_compliance_state(
-                module.params['namespaces']
-            )
-            with open(module.params['state_file'], 'w') as f:
-                json.dump(result['compliance_state'], f)
-        else:
-            if module.params['wait_time'] > 0:
-                time.sleep(module.params['wait_time'])
+            <div class="p-6">
+                {% if comparison.summary.changed > 0 %}
+                    {% for policy_name, policy in comparison.consolidated_view.policies.items() %}
+                        {% if policy.status_change in ['became_noncompliant', 'became_compliant'] %}
+                            <div class="policy-card {% if policy.status_change == 'became_noncompliant' %}bg-red-50{% else %}bg-green-50{% endif %} rounded-lg p-6 mb-4 last:mb-0">
+                                <div class="flex justify-between items-start">
+                                    <div>
+                                        <h4 class="text-lg font-medium {% if policy.status_change == 'became_noncompliant' %}text-red-900{% else %}text-green-900{% endif %}">
+                                            {{ policy_name }}
+                                        </h4>
+                                        {% if policy.details.description %}
+                                            <p class="text-sm {% if policy.status_change == 'became_noncompliant' %}text-red-800{% else %}text-green-800{% endif %} mt-2">
+                                                {{ policy.details.description }}
+                                            </p>
+                                        {% endif %}
+                                    </div>
+                                    <div class="flex space-x-2">
+                                        <span class="px-3 py-1 text-xs font-semibold rounded-full 
+                                            {{ 'bg-purple-100 text-purple-800' if policy.details.remediation_action == 'enforce' 
+                                            else 'bg-blue-100 text-blue-800' }}">
+                                            {{ policy.details.remediation_action|title }}
+                                        </span>
+                                        <span class="status-badge {{ 'became-noncompliant' if policy.status_change == 'became_noncompliant' else 'became-compliant' }}">
+                                            {% if policy.status_change == 'became_noncompliant' %}
+                                                Became Non-Compliant
+                                            {% else %}
+                                                Became Compliant
+                                            {% endif %}
+                                        </span>
+                                    </div>
+                                </div>
 
-            try:
-                with open(module.params['state_file'], 'r') as f:
-                    pre_state = json.load(f)
-            except FileNotFoundError:
-                module.fail_json(msg="Pre-deployment state file not found")
+                                <div class="mt-4 space-y-3">
+                                    {% for hub_name, hub_data in policy.hubs.items() %}
+                                        <div class="{% if policy.status_change == 'became_noncompliant' %}bg-white/50{% else %}bg-white/50{% endif %} rounded-lg p-4">
+                                            <div class="font-medium {% if policy.status_change == 'became_noncompliant' %}text-red-900{% else %}text-green-900{% endif %} pb-2 border-b {% if policy.status_change == 'became_noncompliant' %}border-red-100{% else %}border-green-100{% endif %}">
+                                                <div>
+                                                    <span>Prime Cluster: {{ hub_name }}</span>
+                                                    <p class="text-sm {% if policy.status_change == 'became_noncompliant' %}text-red-700{% else %}text-green-700{% endif %} mt-1">
+                                                        Namespace: {{ hub_data.namespace }}
+                                                    </p>
+                                                </div>
+                                            </div>
+                                            {% if policy.status_change == 'became_noncompliant' and hub_data.noncompliant_clusters %}
+                                                <div class="mt-2 space-y-2">
+                                                    {% for cluster in hub_data.noncompliant_clusters %}
+                                                        <div class="flex items-center justify-between py-2">
+                                                            <span class="text-sm text-red-800">{{ cluster.cluster }}</span>
+                                                            {% if cluster.console_url %}
+                                                                <a href="{{ cluster.console_url }}" 
+                                                                target="_blank"
+                                                                class="text-sm text-red-800 hover:text-red-600 flex items-center">
+                                                                    View in Console
+                                                                    <svg class="w-4 h-4 ml-1" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" 
+                                                                            d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"/>
+                                                                    </svg>
+                                                                </a>
+                                                            {% endif %}
+                                                        </div>
+                                                    {% endfor %}
+                                                </div>
+                                            {% endif %}
+                                        </div>
+                                    {% endfor %}
+                                </div>
+                            </div>
+                        {% endif %}
+                    {% endfor %}
+                {% else %}
+                    <div class="text-brand-gray italic text-center py-8">
+                        <svg class="w-16 h-16 mx-auto mb-4 text-green-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" 
+                                d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"/>
+                        </svg>
+                        <p>No policy changes detected.</p>
+                    </div>
+                {% endif %}
 
-            post_state = validator.get_compliance_state(module.params['namespaces'])
-            comparison = validator.generate_report(pre_state, post_state)
+                <div class="mt-6 pt-4 border-t border-gray-200">
+                    <p class="text-gray-600 text-sm italic">This card shows policies that changed compliance status after policy release.</p>
+                </div>
+            </div>
+        </div>
 
-            result.update({
-                'compliance_state': post_state,
-                'comparison': comparison,
-                'changed': comparison['summary']['newly_noncompliant'] > 0
-            })
+        <!-- All Non-Compliant Policies Section -->
+        <div class="bg-white rounded-lg shadow mb-8">
+            <div class="px-6 py-4 border-b border-gray-200">
+                <h3 class="text-lg font-medium text-brand-blue flex items-center">
+                    <svg class="w-5 h-5 mr-2 text-red-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" 
+                            d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"/>
+                    </svg>
+                    All Non-Compliant Policies
+                </h3>
+            </div>
+            <div class="p-6 space-y-6">
+                {% set grouped_policies = {} %}
+                {% for hub_name, hub_policies in compliance_state.items() %}
+                    {% for policy_name, policy in hub_policies.items() %}
+                        {% if policy.overall_compliance == 'NonCompliant' %}
+                            {% if policy_name not in grouped_policies %}
+                                {% set _ = grouped_policies.update({
+                                    policy_name: {
+                                        'details': policy.details,
+                                        'hubs': {},
+                                        'total_violations': 0
+                                    }
+                                }) %}
+                            {% endif %}
+                            {% set _ = grouped_policies[policy_name].hubs.update({
+                                hub_name: {
+                                    'namespace': policy.namespace,
+                                    'cluster_status': policy.cluster_status
+                                }
+                            }) %}
+                            {% set _ = grouped_policies[policy_name].update({
+                                'total_violations': grouped_policies[policy_name].total_violations + (policy.cluster_status|length)
+                            }) %}
+                        {% endif %}
+                    {% endfor %}
+                {% endfor %}
 
-        module.exit_json(**result)
+                {% for policy_name, policy_data in grouped_policies.items() %}
+                    <div class="policy-card bg-brand-lightblue rounded-lg p-6">
+                        <div class="flex justify-between items-start">
+                            <div class="flex-grow">
+                                <div class="flex items-start justify-between">
+                                    <div>
+                                        <h4 class="text-lg font-medium text-brand-blue">{{ policy_name }}</h4>
+                                    </div>
+                                    <div class="flex flex-wrap gap-2 ml-4">
+                                        <span class="px-3 py-1 text-xs font-semibold rounded-full
+                                            {{ 'bg-purple-100 text-purple-800' if policy_data.details.remediation_action == 'enforce' 
+                                            else 'bg-blue-100 text-blue-800' }}">
+                                            {{ policy_data.details.remediation_action|title }}
+                                        </span>
+                                        <span class="px-3 py-1 text-xs font-semibold rounded-full bg-red-100 text-red-800">
+                                            {{ policy_data.total_violations }} violation(s)
+                                        </span>
+                                    </div>
+                                </div>
+                                {% if policy_data.details.description %}
+                                    <p class="text-sm text-brand-gray mt-2">{{ policy_data.details.description }}</p>
+                                {% endif %}
+                            </div>
+                        </div>
 
-    except Exception as e:
-        module.fail_json(msg=str(e))
+                        <div class="mt-4">
+                            <div class="grid grid-cols-1 gap-4">
+                                {% for hub_name, hub_data in policy_data.hubs.items() %}
+                                    <div class="bg-white rounded-lg p-4 shadow-sm">
+                                        <div class="flex items-center justify-between mb-3 pb-2 border-b border-gray-100">
+                                            <div>
+                                                <span class="font-medium text-brand-blue">Prime Cluster: {{ hub_name }}</span>
+                                                <p class="text-sm text-brand-gray mt-1">Namespace: {{ hub_data.namespace }}</p>
+                                            </div>
+                                            <span class="text-xs bg-brand-lightblue px-2 py-1 rounded-full text-brand-blue">
+                                                {{ hub_data.cluster_status|length }} non-compliant cluster(s)
+                                            </span>
+                                        </div>
+                                        <div class="space-y-3">
+                                            {% for cluster_name, cluster_data in hub_data.cluster_status.items() %}
+                                                <div class="flex items-center justify-between py-2 px-3 bg-gray-50 rounded-lg">
+                                                    <span class="text-sm text-brand-gray">{{ cluster_name }}</span>
+                                                    {% if cluster_data.console_url %}
+                                                        <a href="{{ cluster_data.console_url }}" 
+                                                        target="_blank"
+                                                        class="text-sm text-brand-blue hover:text-brand-blue/80 flex items-center group">
+                                                            View Violation Message
+                                                            <svg class="w-4 h-4 ml-1 transition-transform group-hover:translate-x-0.5" 
+                                                                fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" 
+                                                                    d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"/>
+                                                            </svg>
+                                                        </a>
+                                                    {% endif %}
+                                                </div>
+                                            {% endfor %}
+                                        </div>
+                                    </div>
+                                {% endfor %}
+                            </div>
+                        </div>
+                    </div>
+                {% endfor %}
+            </div>
+        </div>
+    </div>
+    </div>
+    </div>
 
-if __name__ == '__main__':
-    main()
+<!-- Chart Initialization Script -->
+<script>
+document.addEventListener('DOMContentLoaded', function() {
+// Donut Chart for Policy Compliance Overview
+const complianceCtx = document.getElementById('complianceChart').getContext('2d');
+new Chart(complianceCtx, {
+type: 'doughnut',
+data: {
+    labels: ['Compliant', 'Non-Compliant', 'Changed'],
+    datasets: [{
+        data: [
+            {{ comparison.summary.compliant|default(0) }},
+            {{ comparison.summary.total_noncompliant|default(0) }},
+            {{ comparison.summary.changed|default(0) }}
+        ],
+        backgroundColor: [
+            '#22C55E', // green
+            '#EF4444', // red
+            '#EAB308'  // yellow
+        ],
+        borderWidth: 0
+    }]
+},
+options: {
+    responsive: true,
+    maintainAspectRatio: false,
+    cutout: '60%',
+    plugins: {
+        legend: {
+            position: 'bottom',
+            labels: {
+                padding: 20,
+                font: {
+                    size: 12
+                }
+            }
+        },
+        tooltip: {
+            callbacks: {
+                label: function(context) {
+                    return `${context.label}: ${context.raw}`;
+                }
+            }
+        }
+    }
+}
+});
+
+// Bar Chart for Non-Compliant Policies by Prime Cluster
+const clusterCtx = document.getElementById('clusterChart').getContext('2d');
+new Chart(clusterCtx, {
+type: 'bar',
+data: {
+    labels: {{ comparison.summary.cluster_names|tojson|safe }},
+    datasets: [{
+        label: 'Non-Compliant Policies',
+        data: {{ comparison.summary.cluster_noncompliant|tojson|safe }},
+        backgroundColor: '#00658F',
+        borderWidth: 0
+    }]
+},
+options: {
+    responsive: true,
+    maintainAspectRatio: false,
+    scales: {
+        y: {
+            beginAtZero: true,
+            ticks: {
+                stepSize: 1
+            }
+        }
+    },
+    plugins: {
+        legend: {
+            display: false
+        },
+        tooltip: {
+            callbacks: {
+                label: function(context) {
+                    return `Non-Compliant Policies: ${context.raw}`;
+                }
+            }
+        }
+    }
+}
+});
+});
+</script>
+
+</body>
+</html>
