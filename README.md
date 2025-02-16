@@ -1,50 +1,85 @@
+mkdir -pv ~/ee
+
+cd ~/ee
+
+cat <<EOF > bindep.txt
+gcc [platform:rpm]
+make [platform:rpm]
+which [platform:rpm]
+EOF
+
+cat <<EOF > execution-environment.yaml
 ---
-# tasks file for ansible/roles/rhacm-policy-validator
-- name: Install pip packages
-  ## become: true
-  ansible.builtin.pip:
-    name:
-      - jmespath
-      - kubernetes
-      - requests
+version: 3
 
-- name: Create report directory
-  ansible.builtin.file:
-    path: "{{ report_dir | default('./reports') }}/tmp"
-    state: directory
-    mode: '0755'
+build_arg_defaults:
+  ANSIBLE_GALAXY_CLI_COLLECTION_OPTS: '--pre'
 
-- name: Create var to display date/time
-  ansible.builtin.set_fact:
-    date_time: "{{ '%Y-%m-%d %X' | strftime }}"
+options:
+  ## Fix for "/usr/bin/dnf: No such file or directory"
+  package_manager_path: /usr/bin/microdnf
 
-- name: Prepare hub configurations
-  ansible.builtin.set_fact:
-    hub_clusters: "{{ hub_clusters | default([]) + [{'name': item, 'kubeconfig': kubeconfig_path}] }}"
-  loop: "{{ clusters }}"
+dependencies:
+  galaxy: requirements.yaml
+  python: requirements.txt
+  system: bindep.txt
 
-- name: Capture pre-deployment compliance state
-  rhacm_policy_validator:
-    hub_configs: "{{ hub_clusters }}"
-    namespaces: "{{ policy_namespaces }}"
-    state: pre
-    state_file: "{{ report_dir }}/tmp/pre_deployment_state.json"
+images:
+  base_image:
+    name: registry.redhat.io/ansible-automation-platform/ee-minimal-rhel9:2.17.8-4
 
-- name: Validate post-deployment compliance
-  rhacm_policy_validator:
-    hub_configs: "{{ hub_clusters }}"
-    namespaces: "{{ policy_namespaces }}"
-    state: post
-    state_file: "{{ report_dir }}/tmp/pre_deployment_state.json"
-    wait_time: "{{ wait_time | default(300) }}"  # Adjust based on your needs
-  register: validation_result
+additional_build_steps:
+  ## Fix for When building an EE which includes the redhat.openshift collection
+  prepend_builder:
+    - ENV PKGMGR_OPTS="--nodocs --setopt=install_weak_deps=0 --setopt=rhocp-4.17-for-rhel-9-x86_64-rpms.enabled=true"
+  prepend_final:
+    - ENV PKGMGR_OPTS="--nodocs --setopt=install_weak_deps=0 --setopt=rhocp-4.17-for-rhel-9-x86_64-rpms.enabled=true"
+    - RUN microdnf clean all
+EOF
 
-- name: Generate validation report
-  ansible.builtin.template:
-    src: summary-report.html.j2
-    dest: "{{ report_dir }}/summary-report.html"
-    mode: '0644'
-  vars:
-    comparison: "{{ validation_result.comparison }}"
-    compliance_state: "{{ validation_result.compliance_state }}"
-    ## date_time: "{{ date_time }}"
+cat <<EOF > requirements.txt
+ansible-modules-hashivault
+requests-oauthlib
+cryptography
+kubernetes
+jsonpatch
+pynetbox
+requests
+jmespath
+paramiko
+PyYAML
+EOF
+
+cat <<EOF > requirements.yaml
+---
+collections:
+  - name: ansible.posix
+  - name: community.general
+  - name: community.crypto
+
+# Include collections below if targeting a Kubernetes /OpenShift environment.
+  - name: community.kubernetes
+  - name: kubernetes.core
+  - name: community.okd
+
+# Include collection below if building a virtual host.
+  ## - name: https://github.com/ansible-collections/community.libvirt
+  ##   type: git
+  ##   version: main
+
+# Include collections below if playbook deploys to cloud.
+  ## - name: community.aws
+  ## - name: google.cloud
+  ## - name: community.azure
+  ## - name: community.azure
+  ## - name: community.aws
+  ## - name: community.digitalocean
+
+  # Added for community.dns.hetzner_dns_record.
+  ## - name: community.dns
+
+  # Added for community.docker
+  ## - name: community.docker
+  EOF
+
+  ansible-builder build --t quay.io/rh_ee_iijere/rh-ocp-ee:2025021501 --prune-images -v3
