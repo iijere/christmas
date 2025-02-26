@@ -134,14 +134,17 @@
 
             <div class="p-6">
                 {% if comparison.summary.changed > 0 %}
-                    {% for policy_name, policy in comparison.consolidated_view.policies.items() %}
+                    {% for display_key, policy in comparison.consolidated_view.policies.items() %}
                         {% if policy.status_change in ['became_noncompliant', 'became_compliant'] %}
                             <div class="policy-card {% if policy.status_change == 'became_noncompliant' %}bg-red-50{% else %}bg-green-50{% endif %} rounded-lg p-6 mb-4 last:mb-0">
                                 <div class="flex justify-between items-start">
                                     <div>
                                         <h4 class="text-lg font-medium {% if policy.status_change == 'became_noncompliant' %}text-red-900{% else %}text-green-900{% endif %}">
-                                            {{ policy_name }}
+                                            {{ policy.policy_name }}
                                         </h4>
+                                        <span class="text-sm {% if policy.status_change == 'became_noncompliant' %}text-red-700{% else %}text-green-700{% endif %} mt-1">
+                                            {{ policy.namespace }}
+                                        </span>
                                         {% if policy.details.description %}
                                             <p class="text-sm {% if policy.status_change == 'became_noncompliant' %}text-red-800{% else %}text-green-800{% endif %} mt-2">
                                                 {{ policy.details.description }}
