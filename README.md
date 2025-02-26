@@ -120,7 +120,7 @@
             </div>
         </div>
 
-        <!-- Policy Changes Section -->
+        <!-- Policy Changes Section (Fixed) -->
         <div class="bg-white rounded-lg shadow mb-8">
             <div class="px-6 py-4 border-b border-gray-200">
                 <h3 class="text-lg font-medium text-gray-900 flex items-center">
@@ -134,75 +134,112 @@
 
             <div class="p-6">
                 {% if comparison.summary.changed > 0 %}
+                    {% set grouped_changes = {} %}
                     {% for display_key, policy in comparison.consolidated_view.policies.items() %}
                         {% if policy.status_change in ['became_noncompliant', 'became_compliant'] %}
-                            <div class="policy-card {% if policy.status_change == 'became_noncompliant' %}bg-red-50{% else %}bg-green-50{% endif %} rounded-lg p-6 mb-4 last:mb-0">
-                                <div class="flex justify-between items-start">
-                                    <div>
-                                        <h4 class="text-lg font-medium {% if policy.status_change == 'became_noncompliant' %}text-red-900{% else %}text-green-900{% endif %}">
-                                            {{ policy.policy_name }}
-                                        </h4>
-                                        <span class="text-sm {% if policy.status_change == 'became_noncompliant' %}text-red-700{% else %}text-green-700{% endif %} mt-1">
-                                            {{ policy.namespace }}
-                                        </span>
-                                        {% if policy.details.description %}
-                                            <p class="text-sm {% if policy.status_change == 'became_noncompliant' %}text-red-800{% else %}text-green-800{% endif %} mt-2">
-                                                {{ policy.details.description }}
-                                            </p>
-                                        {% endif %}
-                                    </div>
-                                    <div class="flex space-x-2">
-                                        <span class="px-3 py-1 text-xs font-semibold rounded-full 
-                                            {{ 'bg-purple-100 text-purple-800' if policy.details.remediation_action == 'enforce' 
-                                            else 'bg-blue-100 text-blue-800' }}">
-                                            {{ policy.details.remediation_action|title }}
-                                        </span>
-                                        <span class="status-badge {{ 'became-noncompliant' if policy.status_change == 'became_noncompliant' else 'became-compliant' }}">
-                                            {% if policy.status_change == 'became_noncompliant' %}
-                                                Became Non-Compliant
-                                            {% else %}
-                                                Became Compliant
-                                            {% endif %}
-                                        </span>
-                                    </div>
+                            {% set actual_name = policy.policy_name %}
+                            
+                            {% if actual_name not in grouped_changes %}
+                                {% set _ = grouped_changes.update({
+                                    actual_name: {
+                                        'instances': [],
+                                        'description': policy.details.description,
+                                        'remediation_action': policy.details.remediation_action,
+                                        'status_change': policy.status_change
+                                    }
+                                }) %}
+                            {% endif %}
+                            
+                            {% set instance = {
+                                'namespace': policy.namespace,
+                                'hubs': policy.hubs
+                            } %}
+                            
+                            {% set _ = grouped_changes[actual_name].instances.append(instance) %}
+                        {% endif %}
+                    {% endfor %}
+                    
+                    {% for policy_name, policy_data in grouped_changes.items() %}
+                        <div class="policy-card {% if policy_data.status_change == 'became_noncompliant' %}bg-red-50{% else %}bg-green-50{% endif %} rounded-lg p-6 mb-4 last:mb-0">
+                            <div class="flex justify-between items-start mb-4">
+                                <div>
+                                    <h4 class="text-lg font-medium {% if policy_data.status_change == 'became_noncompliant' %}text-red-900{% else %}text-green-900{% endif %}">
+                                        {{ policy_name }}
+                                    </h4>
+                                    {% if policy_data.description %}
+                                        <p class="text-sm {% if policy_data.status_change == 'became_noncompliant' %}text-red-800{% else %}text-green-800{% endif %} mt-1">
+                                            {{ policy_data.description }}
+                                        </p>
+                                    {% endif %}
                                 </div>
-
-                                <div class="mt-4 space-y-3">
-                                    {% for hub_name, hub_data in policy.hubs.items() %}
-                                        <div class="{% if policy.status_change == 'became_noncompliant' %}bg-white/50{% else %}bg-white/50{% endif %} rounded-lg p-4">
-                                            <div class="font-medium {% if policy.status_change == 'became_noncompliant' %}text-red-900{% else %}text-green-900{% endif %} pb-2 border-b {% if policy.status_change == 'became_noncompliant' %}border-red-100{% else %}border-green-100{% endif %}">
-                                                <div>
-                                                    <span>Prime Cluster: {{ hub_name }}</span>
-                                                    <p class="text-sm {% if policy.status_change == 'became_noncompliant' %}text-red-700{% else %}text-green-700{% endif %} mt-1">
-                                                        Namespace: {{ hub_data.namespace }}
-                                                    </p>
-                                                </div>
-                                            </div>
-                                            {% if policy.status_change == 'became_noncompliant' and hub_data.noncompliant_clusters %}
-                                                <div class="mt-2 space-y-2">
-                                                    {% for cluster in hub_data.noncompliant_clusters %}
-                                                        <div class="flex items-center justify-between py-2">
-                                                            <span class="text-sm text-red-800">{{ cluster.cluster }}</span>
-                                                            {% if cluster.console_url %}
-                                                                <a href="{{ cluster.console_url }}" 
-                                                                target="_blank"
-                                                                class="text-sm text-red-800 hover:text-red-600 flex items-center">
-                                                                    View in Console
-                                                                    <svg class="w-4 h-4 ml-1" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" 
-                                                                            d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"/>
-                                                                    </svg>
-                                                                </a>
-                                                            {% endif %}
-                                                        </div>
-                                                    {% endfor %}
-                                                </div>
-                                            {% endif %}
-                                        </div>
-                                    {% endfor %}
+                                <div class="flex space-x-2">
+                                    <span class="px-3 py-1 text-xs font-semibold rounded-full 
+                                        {{ 'bg-purple-100 text-purple-800' if policy_data.remediation_action == 'enforce' 
+                                        else 'bg-blue-100 text-blue-800' }}">
+                                        {{ policy_data.remediation_action|title }}
+                                    </span>
+                                    <span class="status-badge {{ 'became-noncompliant' if policy_data.status_change == 'became_noncompliant' else 'became-compliant' }}">
+                                        {% if policy_data.status_change == 'became_noncompliant' %}
+                                            Became Non-Compliant
+                                        {% else %}
+                                            Became Compliant
+                                        {% endif %}
+                                    </span>
                                 </div>
                             </div>
-                        {% endif %}
+
+                            <div class="space-y-3 divide-y {% if policy_data.status_change == 'became_noncompliant' %}divide-red-100{% else %}divide-green-100{% endif %}">
+                                {% for instance in policy_data.instances %}
+                                    <div class="pt-3 first:pt-0">
+                                        <div class="{% if policy_data.status_change == 'became_noncompliant' %}bg-white/50{% else %}bg-white/50{% endif %} rounded-lg overflow-hidden">
+                                            <div class="font-medium {% if policy_data.status_change == 'became_noncompliant' %}text-red-900{% else %}text-green-900{% endif %} p-3">
+                                                <span>Namespace: {{ instance.namespace }}</span>
+                                            </div>
+                                            
+                                            <div class="space-y-3 p-3">
+                                                {% for hub_name, hub_data in instance.hubs.items() %}
+                                                    <div class="bg-white rounded-lg p-3 shadow-sm">
+                                                        <div class="flex items-center justify-between pb-2 mb-2 border-b {% if policy_data.status_change == 'became_noncompliant' %}border-red-100{% else %}border-green-100{% endif %}">
+                                                            <div>
+                                                                <span class="font-medium {% if policy_data.status_change == 'became_noncompliant' %}text-red-700{% else %}text-green-700{% endif %}">
+                                                                    Prime Cluster: {{ hub_name }}
+                                                                </span>
+                                                            </div>
+                                                            <div class="text-xs {% if policy_data.status_change == 'became_noncompliant' %}bg-red-100 text-red-800{% else %}bg-green-100 text-green-800{% endif %} px-2 py-1 rounded-full">
+                                                                {{ hub_data.current_status }}
+                                                            </div>
+                                                        </div>
+                                                        
+                                                        {% if policy_data.status_change == 'became_noncompliant' and hub_data.noncompliant_clusters %}
+                                                            <div class="space-y-2">
+                                                                {% for cluster in hub_data.noncompliant_clusters %}
+                                                                    <div class="flex items-center justify-between py-2 px-3 {% if policy_data.status_change == 'became_noncompliant' %}bg-red-50{% else %}bg-green-50{% endif %} rounded-lg">
+                                                                        <span class="text-sm {% if policy_data.status_change == 'became_noncompliant' %}text-red-800{% else %}text-green-800{% endif %}">
+                                                                            {{ cluster.cluster }}
+                                                                        </span>
+                                                                        {% if cluster.console_url %}
+                                                                            <a href="{{ cluster.console_url }}" 
+                                                                            target="_blank"
+                                                                            class="text-sm {% if policy_data.status_change == 'became_noncompliant' %}text-red-800 hover:text-red-600{% else %}text-green-800 hover:text-green-600{% endif %} flex items-center group">
+                                                                                View in Console
+                                                                                <svg class="w-4 h-4 ml-1 group-hover:translate-x-0.5 transition-transform" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                                                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" 
+                                                                                        d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"/>
+                                                                                </svg>
+                                                                            </a>
+                                                                        {% endif %}
+                                                                    </div>
+                                                                {% endfor %}
+                                                            </div>
+                                                        {% endif %}
+                                                    </div>
+                                                {% endfor %}
+                                            </div>
+                                        </div>
+                                    </div>
+                                {% endfor %}
+                            </div>
+                        </div>
                     {% endfor %}
                 {% else %}
                     <div class="text-brand-gray italic text-center py-8">
@@ -220,7 +257,7 @@
             </div>
         </div>
 
-        <!-- All Non-Compliant Policies Section -->
+        <!-- All Non-Compliant Policies Section (Fixed) -->
         <div class="bg-white rounded-lg shadow mb-8">
             <div class="px-6 py-4 border-b border-gray-200">
                 <h3 class="text-lg font-medium text-brand-blue flex items-center">
@@ -232,7 +269,7 @@
                 </h3>
             </div>
             <div class="p-6 space-y-6">
-                {% set grouped_policies = {} %}
+                {% set base_name_grouped_policies = {} %}
                 {% for hub_name, hub_policies in compliance_state.items() %}
                     {% for policy_key, policy in hub_policies.items() %}
                         {% if policy.overall_compliance == 'NonCompliant' %}
@@ -240,93 +277,94 @@
                             {% set namespace = key_parts[0] %}
                             {% set policy_name = key_parts[1:] | join('/') %}
                             
-                            {% set display_key = policy_name ~ ' (' ~ namespace ~ ')' %}
-                            
-                            {% if display_key not in grouped_policies %}
-                                {% set _ = grouped_policies.update({
-                                    display_key: {
-                                        'details': policy.details,
-                                        'hubs': {},
+                            {% if policy_name not in base_name_grouped_policies %}
+                                {% set _ = base_name_grouped_policies.update({
+                                    policy_name: {
+                                        'instances': [],
                                         'total_violations': 0,
-                                        'namespace': namespace,
-                                        'policy_name': policy_name
+                                        'remediation_action': policy.details.remediation_action,
+                                        'description': policy.details.description
                                     }
                                 }) %}
                             {% endif %}
-                            {% set _ = grouped_policies[display_key].hubs.update({
-                                hub_name: {
-                                    'namespace': policy.namespace,
-                                    'cluster_status': policy.cluster_status
-                                }
-                            }) %}
-                            {% set _ = grouped_policies[display_key].update({
-                                'total_violations': grouped_policies[display_key].total_violations + (policy.cluster_status|length)
+                            
+                            {% set instance = {
+                                'hub_name': hub_name,
+                                'namespace': namespace,
+                                'cluster_status': policy.cluster_status,
+                                'violation_count': policy.cluster_status|length
+                            } %}
+                            
+                            {% set _ = base_name_grouped_policies[policy_name].instances.append(instance) %}
+                            {% set _ = base_name_grouped_policies[policy_name].update({
+                                'total_violations': base_name_grouped_policies[policy_name].total_violations + instance.violation_count
                             }) %}
                         {% endif %}
                     {% endfor %}
                 {% endfor %}
 
-                {% for display_key, policy_data in grouped_policies.items() %}
+                {% for policy_name, policy_data in base_name_grouped_policies.items() %}
                     <div class="policy-card bg-brand-lightblue rounded-lg p-6">
-                        <div class="flex justify-between items-start">
-                            <div class="flex-grow">
-                                <div class="flex items-start justify-between">
-                                    <div>
-                                        <h4 class="text-lg font-medium text-brand-blue">{{ policy_data.policy_name }}</h4>
-                                        <span class="text-sm text-brand-gray">Namespace: {{ policy_data.namespace }}</span>
-                                    </div>
-                                    <div class="flex flex-wrap gap-2 ml-4">
-                                        <span class="px-3 py-1 text-xs font-semibold rounded-full
-                                            {{ 'bg-purple-100 text-purple-800' if policy_data.details.remediation_action == 'enforce' 
-                                            else 'bg-blue-100 text-blue-800' }}">
-                                            {{ policy_data.details.remediation_action|title }}
-                                        </span>
-                                        <span class="px-3 py-1 text-xs font-semibold rounded-full bg-red-100 text-red-800">
-                                            {{ policy_data.total_violations }} violation(s)
-                                        </span>
-                                    </div>
-                                </div>
-                                {% if policy_data.details.description %}
-                                    <p class="text-sm text-brand-gray mt-2">{{ policy_data.details.description }}</p>
+                        <div class="flex justify-between items-start mb-4">
+                            <div>
+                                <h4 class="text-lg font-medium text-brand-blue">{{ policy_name }}</h4>
+                                {% if policy_data.description %}
+                                    <p class="text-sm text-brand-gray mt-1">{{ policy_data.description }}</p>
                                 {% endif %}
+                            </div>
+                            <div class="flex space-x-2">
+                                <span class="px-3 py-1 text-xs font-semibold rounded-full
+                                    {{ 'bg-purple-100 text-purple-800' if policy_data.remediation_action == 'enforce' 
+                                    else 'bg-blue-100 text-blue-800' }}">
+                                    {{ policy_data.remediation_action|title }}
+                                </span>
+                                <span class="px-3 py-1 text-xs font-semibold rounded-full bg-red-100 text-red-800">
+                                    {{ policy_data.total_violations }} violation(s)
+                                </span>
                             </div>
                         </div>
 
-                        <div class="mt-4">
-                            <div class="grid grid-cols-1 gap-4">
-                                {% for hub_name, hub_data in policy_data.hubs.items() %}
-                                    <div class="bg-white rounded-lg p-4 shadow-sm">
-                                        <div class="flex items-center justify-between mb-3 pb-2 border-b border-gray-100">
+                        <div class="space-y-3 divide-y divide-gray-100">
+                            {% for instance in policy_data.instances %}
+                                <div class="pt-3 first:pt-0">
+                                    <div class="bg-white rounded-lg shadow-sm overflow-hidden">
+                                        <div class="flex items-center justify-between p-4 bg-gray-50">
                                             <div>
-                                                <span class="font-medium text-brand-blue">Prime Cluster: {{ hub_name }}</span>
-                                                <p class="text-sm text-brand-gray mt-1">Namespace: {{ hub_data.namespace }}</p>
+                                                <div class="flex items-center">
+                                                    <span class="font-medium text-brand-blue">{{ instance.hub_name }}</span>
+                                                    <span class="mx-2 text-gray-400">•</span>
+                                                    <span class="text-sm text-gray-600">{{ instance.namespace }}</span>
+                                                </div>
                                             </div>
-                                            <span class="text-xs bg-brand-lightblue px-2 py-1 rounded-full text-brand-blue">
-                                                {{ hub_data.cluster_status|length }} non-compliant cluster(s)
+                                            <span class="text-xs bg-blue-100 text-blue-800 px-2 py-1 rounded-full">
+                                                {{ instance.violation_count }} non-compliant cluster(s)
                                             </span>
                                         </div>
-                                        <div class="space-y-3">
-                                            {% for cluster_name, cluster_data in hub_data.cluster_status.items() %}
-                                                <div class="flex items-center justify-between py-2 px-3 bg-gray-50 rounded-lg">
-                                                    <span class="text-sm text-brand-gray">{{ cluster_name }}</span>
-                                                    {% if cluster_data.console_url %}
-                                                        <a href="{{ cluster_data.console_url }}" 
-                                                        target="_blank"
-                                                        class="text-sm text-brand-blue hover:text-brand-blue/80 flex items-center group">
-                                                            View Violation Message
-                                                            <svg class="w-4 h-4 ml-1 transition-transform group-hover:translate-x-0.5" 
-                                                                fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" 
-                                                                    d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"/>
-                                                            </svg>
-                                                        </a>
-                                                    {% endif %}
-                                                </div>
-                                            {% endfor %}
+                                        
+                                        <div class="p-4">
+                                            <div class="space-y-3">
+                                                {% for cluster_name, cluster_data in instance.cluster_status.items() %}
+                                                    <div class="flex items-center justify-between py-2 px-3 bg-gray-50 rounded-lg">
+                                                        <span class="text-sm text-brand-gray">{{ cluster_name }}</span>
+                                                        {% if cluster_data.console_url %}
+                                                            <a href="{{ cluster_data.console_url }}" 
+                                                            target="_blank"
+                                                            class="text-sm text-brand-blue hover:text-brand-blue/80 flex items-center group">
+                                                                View Violation Message
+                                                                <svg class="w-4 h-4 ml-1 transition-transform group-hover:translate-x-0.5" 
+                                                                    fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" 
+                                                                        d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"/>
+                                                                </svg>
+                                                            </a>
+                                                        {% endif %}
+                                                    </div>
+                                                {% endfor %}
+                                            </div>
                                         </div>
                                     </div>
-                                {% endfor %}
-                            </div>
+                                </div>
+                            {% endfor %}
                         </div>
                     </div>
                 {% endfor %}
