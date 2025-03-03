@@ -1,466 +1,531 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>RHACM Policy Report</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/3.9.1/chart.min.js"></script>
-    <script>
-        tailwind.config = {
-            theme: {
-                extend: {
-                    colors: {
-                        brand: {
-                            blue: '#004B87',
-                            lightblue: '#E5EEF4',
-                            gray: '#58595B',
-                            lightgray: '#F4F4F4'
-                        }
-                    }
-                }
-            }
-        }
-    </script>
-    <style>
-        .policy-card {
-            transition: transform 0.2s ease-in-out;
-        }
-        .policy-card:hover {
-            transform: translateY(-2px);
-        }
-        .status-badge {
-            @apply px-3 py-1 text-xs font-semibold rounded-full;
-        }
-        .status-badge.became-noncompliant {
-            @apply bg-red-100 text-red-800;
-        }
-        .status-badge.became-compliant {
-            @apply bg-green-100 text-green-800;
-        }
-    </style>
-</head>
-<body class="bg-brand-lightgray min-h-screen">
-    
-    <!-- Fixed Header -->
-    <nav class="bg-brand-blue shadow fixed w-full z-10">
-        <div class="max-w-7xl mx-auto px-4">
-            <div class="flex justify-between h-16">
-                <div class="flex items-center">
-                    <h1 class="text-xl font-bold text-white">RHACM Policy Report</h1>
-                </div>
-                <div class="flex items-center space-x-4">
-                    <div class="px-3 py-2 rounded-lg bg-white/10">
-                        <span class="text-white text-sm">
-                            Prime Clusters: <span class="font-bold">{{ comparison.summary.total_hubs|default(0) }}</span>
-                        </span>
-                    </div>
-                    <div class="px-3 py-2 rounded-lg bg-red-500/20">
-                        <span class="text-white text-sm">
-                            Managed Clusters: <span class="font-bold">{{ comparison.summary.total_noncompliant_clusters|default(0) }}</span>
-                        </span>
-                    </div>
-                    <span class="text-gray-300 text-sm">{{ date_time }}</span>
-                </div>
-            </div>
-        </div>
-    </nav>
+#!/usr/bin/env python
+# This script is run on MKS Nodes, parses log files in
+# /var/log/chrony/ up until the oldest date found
+# and exports the data to a s3 bucket for FINRA compliance.
+# Optimized to reduce S3 API load across large clusters
+##
 
-    <!-- Main Content -->
-    <div class="pt-20">
-        <div class="max-w-7xl mx-auto px-4">
+import logging
+import logging.handlers as handlers
+import os
+import sys
+import tempfile
+import time
+import urllib3
+import json
+import hashlib
+import random
+from datetime import datetime, timedelta
+from threading import Timer
+from requests.exceptions import SSLError
+from pythonjsonlogger import jsonlogger
 
-        <!-- Dashboard -->
-        <div class="mb-8">
-            <!-- Charts Grid -->
-            <div class="grid grid-cols-1 md:grid-cols-2 gap-6 my-8">
-                <!-- Donut Chart -->
-                <div class="bg-white rounded-lg shadow">
-                    <div class="p-4 border-b border-gray-200">
-                        <h3 class="text-lg font-medium text-gray-900">Policy Compliance Overview</h3>
-                    </div>
-                    <div class="p-4">
-                        <div class="relative" style="height: 280px;">
-                            <canvas id="complianceChart"></canvas>
-                        </div>
-                    </div>
-                </div>
-                
-                <!-- Bar Chart -->
-                <div class="bg-white rounded-lg shadow">
-                    <div class="p-4 border-b border-gray-200">
-                        <h3 class="text-lg font-medium text-gray-900">Non-Compliant Policies by Prime Cluster</h3>
-                    </div>
-                    <div class="p-4">
-                        <div class="relative" style="height: 280px;">
-                            <canvas id="clusterChart"></canvas>
-                        </div>
-                    </div>
-                </div>
-            </div>
-            
-            <!-- Stats Cards -->
-            <div class="grid grid-cols-2 md:grid-cols-4 gap-6">
-                <div class="bg-white rounded-lg shadow p-4">
-                    <div class="text-sm text-gray-600 mb-1">Total Policies</div>
-                    <div class="text-2xl font-semibold text-brand-blue">{{ comparison.summary.total_policies|default(0) }}</div>
-                </div>
-                <div class="bg-white rounded-lg shadow p-4">
-                    <div class="text-sm text-gray-600 mb-1">Compliant</div>
-                    <div class="text-2xl font-semibold text-green-600">{{ comparison.summary.compliant|default(0) }}</div>
-                </div>
-                <div class="bg-white rounded-lg shadow p-4">
-                    <div class="text-sm text-gray-600 mb-1">Non-Compliant</div>
-                    <div class="text-2xl font-semibold text-red-600">{{ comparison.summary.total_noncompliant|default(0) }}</div>
-                </div>
-                <div class="bg-white rounded-lg shadow p-4">
-                    <div class="text-sm text-gray-600 mb-1">Changed</div>
-                    <div class="text-2xl font-semibold text-yellow-600">{{ comparison.summary.changed|default(0) }}</div>
-                </div>
-            </div>
-        </div>
+# The following imports and config overrides
+# are necessary for accessing the ms on-prem ecs3
+# https://jive.ms.com/docs/DOC-814168
+import requests
+requests.packages.urllib3.util.ssl_.DEFAULT_CIPHERS += ':!DH'
+import urllib3
+urllib3.util.ssl_.DEFAULT_CIPHERS += ':!DH'
+import boto3
+from botocore.config import Config
+from botocore.exceptions import ClientError
 
-        <!-- Policy Changes Section (Fixed) -->
-        <div class="bg-white rounded-lg shadow mb-8">
-            <div class="px-6 py-4 border-b border-gray-200">
-                <h3 class="text-lg font-medium text-gray-900 flex items-center">
-                    <svg class="w-5 h-5 mr-2 text-yellow-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" 
-                            d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/>
-                    </svg>
-                    Policy Changes
-                </h3>
-            </div>
+# Environment variables
+CHRONY_STATS_DIR = os.environ.get("CHRONY_STATS_DIR", "/host/var/log/chrony")
+NODE_NAME = os.environ.get("NODE_NAME", "")
+CLUSTER_NAME = os.environ.get("CLUSTER_NAME", "")  # Added cluster name for organization
+S3_ENDPOINT = os.environ.get("S3_ENDPOINT_URL", "")
+S3_SECRET_SECRET_KEY = os.environ.get("S3_SECRET_SECRET_KEY", "")
+S3_SECRET_ACCESS_KEY = os.environ.get("S3_SECRET_ACCESS_KEY", "")
+BUCKET_NAME = os.environ.get("BUCKET_NAME", "")
+# New env variables for optimizations
+BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "5"))  # Number of days to process in one batch
+JITTER_MAX_SECONDS = int(os.environ.get("JITTER_MAX_SECONDS", "300"))  # Max seconds to delay execution
+UPLOAD_FREQUENCY_HOURS = int(os.environ.get("UPLOAD_FREQUENCY_HOURS", "12"))  # How often to upload (hours)
+USE_COMPRESSION = os.environ.get("USE_COMPRESSION", "true").lower() == "true"  # Whether to compress logs
 
-            <div class="p-6">
-                {% if comparison.summary.changed > 0 %}
-                    {% set grouped_changes = {} %}
-                    {% for display_key, policy in comparison.consolidated_view.policies.items() %}
-                        {% if policy.status_change in ['became_noncompliant', 'became_compliant'] %}
-                            {% set actual_name = policy.policy_name %}
-                            
-                            {% if actual_name not in grouped_changes %}
-                                {% set _ = grouped_changes.update({
-                                    actual_name: {
-                                        'instances': [],
-                                        'description': policy.details.description,
-                                        'remediation_action': policy.details.remediation_action,
-                                        'status_change': policy.status_change
-                                    }
-                                }) %}
-                            {% endif %}
-                            
-                            {% set instance = {
-                                'namespace': policy.namespace,
-                                'hubs': policy.hubs
-                            } %}
-                            
-                            {% set _ = grouped_changes[actual_name].instances.append(instance) %}
-                        {% endif %}
-                    {% endfor %}
-                    
-                    {% for policy_name, policy_data in grouped_changes.items() %}
-                        <div class="policy-card {% if policy_data.status_change == 'became_noncompliant' %}bg-red-50{% else %}bg-green-50{% endif %} rounded-lg p-6 mb-4 last:mb-0">
-                            <div class="flex justify-between items-start mb-4">
-                                <div>
-                                    <h4 class="text-lg font-medium {% if policy_data.status_change == 'became_noncompliant' %}text-red-900{% else %}text-green-900{% endif %}">
-                                        {{ policy_name }}
-                                    </h4>
-                                    {% if policy_data.description %}
-                                        <p class="text-sm {% if policy_data.status_change == 'became_noncompliant' %}text-red-800{% else %}text-green-800{% endif %} mt-1">
-                                            {{ policy_data.description }}
-                                        </p>
-                                    {% endif %}
-                                </div>
-                                <div class="flex space-x-2">
-                                    <span class="px-3 py-1 text-xs font-semibold rounded-full 
-                                        {{ 'bg-purple-100 text-purple-800' if policy_data.remediation_action == 'enforce' 
-                                        else 'bg-blue-100 text-blue-800' }}">
-                                        {{ policy_data.remediation_action|title }}
-                                    </span>
-                                    <span class="status-badge {{ 'became-noncompliant' if policy_data.status_change == 'became_noncompliant' else 'became-compliant' }}">
-                                        {% if policy_data.status_change == 'became_noncompliant' %}
-                                            Became Non-Compliant
-                                        {% else %}
-                                            Became Compliant
-                                        {% endif %}
-                                    </span>
-                                </div>
-                            </div>
+LOG_HEADER_BORDER = "======================================================================================================"
+LOG_HEADER_COLUMNS = "    Date (UTC) Time      IP Address     Std dev'n Est offset  Offset sd  Diff freq   Est skew  Stress  Ns  Bs  Nr  Asym"
+LOG_HEADER = LOG_HEADER_BORDER + '\n' + LOG_HEADER_COLUMNS + '\n' + LOG_HEADER_BORDER + '\n'
 
-                            <div class="space-y-3 divide-y {% if policy_data.status_change == 'became_noncompliant' %}divide-red-100{% else %}divide-green-100{% endif %}">
-                                {% for instance in policy_data.instances %}
-                                    <div class="pt-3 first:pt-0">
-                                        <div class="{% if policy_data.status_change == 'became_noncompliant' %}bg-white/50{% else %}bg-white/50{% endif %} rounded-lg overflow-hidden">
-                                            <div class="font-medium {% if policy_data.status_change == 'became_noncompliant' %}text-red-900{% else %}text-green-900{% endif %} p-3">
-                                                <span>Namespace: {{ instance.namespace }}</span>
-                                            </div>
-                                            
-                                            <div class="space-y-3 p-3">
-                                                {% for hub_name, hub_data in instance.hubs.items() %}
-                                                    <div class="bg-white rounded-lg p-3 shadow-sm">
-                                                        <div class="flex items-center justify-between pb-2 mb-2 border-b {% if policy_data.status_change == 'became_noncompliant' %}border-red-100{% else %}border-green-100{% endif %}">
-                                                            <div>
-                                                                <span class="font-medium {% if policy_data.status_change == 'became_noncompliant' %}text-red-700{% else %}text-green-700{% endif %}">
-                                                                    Prime Cluster: {{ hub_name }}
-                                                                </span>
-                                                            </div>
-                                                            <div class="text-xs {% if policy_data.status_change == 'became_noncompliant' %}bg-red-100 text-red-800{% else %}bg-green-100 text-green-800{% endif %} px-2 py-1 rounded-full">
-                                                                {{ hub_data.current_status }}
-                                                            </div>
-                                                        </div>
-                                                        
-                                                        {% if policy_data.status_change == 'became_noncompliant' and hub_data.noncompliant_clusters %}
-                                                            <div class="space-y-2">
-                                                                {% for cluster in hub_data.noncompliant_clusters %}
-                                                                    <div class="flex items-center justify-between py-2 px-3 {% if policy_data.status_change == 'became_noncompliant' %}bg-red-50{% else %}bg-green-50{% endif %} rounded-lg">
-                                                                        <span class="text-sm {% if policy_data.status_change == 'became_noncompliant' %}text-red-800{% else %}text-green-800{% endif %}">
-                                                                            {{ cluster.cluster }}
-                                                                        </span>
-                                                                        {% if cluster.console_url %}
-                                                                            <a href="{{ cluster.console_url }}" 
-                                                                            target="_blank"
-                                                                            class="text-sm {% if policy_data.status_change == 'became_noncompliant' %}text-red-800 hover:text-red-600{% else %}text-green-800 hover:text-green-600{% endif %} flex items-center group">
-                                                                                View in Console
-                                                                                <svg class="w-4 h-4 ml-1 group-hover:translate-x-0.5 transition-transform" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                                                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" 
-                                                                                        d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"/>
-                                                                                </svg>
-                                                                            </a>
-                                                                        {% endif %}
-                                                                    </div>
-                                                                {% endfor %}
-                                                            </div>
-                                                        {% endif %}
-                                                    </div>
-                                                {% endfor %}
-                                            </div>
-                                        </div>
-                                    </div>
-                                {% endfor %}
-                            </div>
-                        </div>
-                    {% endfor %}
-                {% else %}
-                    <div class="text-brand-gray italic text-center py-8">
-                        <svg class="w-16 h-16 mx-auto mb-4 text-green-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" 
-                                d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"/>
-                        </svg>
-                        <p>No policy changes detected.</p>
-                    </div>
-                {% endif %}
-
-                <div class="mt-6 pt-4 border-t border-gray-200">
-                    <p class="text-gray-600 text-sm italic">This card shows policies that changed compliance status after policy release.</p>
-                </div>
-            </div>
-        </div>
-
-        <!-- All Non-Compliant Policies Section (Fixed) -->
-        <div class="bg-white rounded-lg shadow mb-8">
-            <div class="px-6 py-4 border-b border-gray-200">
-                <h3 class="text-lg font-medium text-brand-blue flex items-center">
-                    <svg class="w-5 h-5 mr-2 text-red-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" 
-                            d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"/>
-                    </svg>
-                    All Non-Compliant Policies
-                </h3>
-            </div>
-            <div class="p-6 space-y-6">
-                {% set base_name_grouped_policies = {} %}
-                {% for hub_name, hub_policies in compliance_state.items() %}
-                    {% for policy_key, policy in hub_policies.items() %}
-                        {% if policy.overall_compliance == 'NonCompliant' %}
-                            {% set key_parts = policy_key.split('/') %}
-                            {% set namespace = key_parts[0] %}
-                            {% set policy_name = key_parts[1:] | join('/') %}
-                            
-                            {% if policy_name not in base_name_grouped_policies %}
-                                {% set _ = base_name_grouped_policies.update({
-                                    policy_name: {
-                                        'instances': [],
-                                        'total_violations': 0,
-                                        'remediation_action': policy.details.remediation_action,
-                                        'description': policy.details.description
-                                    }
-                                }) %}
-                            {% endif %}
-                            
-                            {% set instance = {
-                                'hub_name': hub_name,
-                                'namespace': namespace,
-                                'cluster_status': policy.cluster_status,
-                                'violation_count': policy.cluster_status|length
-                            } %}
-                            
-                            {% set _ = base_name_grouped_policies[policy_name].instances.append(instance) %}
-                            {% set _ = base_name_grouped_policies[policy_name].update({
-                                'total_violations': base_name_grouped_policies[policy_name].total_violations + instance.violation_count
-                            }) %}
-                        {% endif %}
-                    {% endfor %}
-                {% endfor %}
-
-                {% for policy_name, policy_data in base_name_grouped_policies.items() %}
-                    <div class="policy-card bg-brand-lightblue rounded-lg p-6">
-                        <div class="flex justify-between items-start mb-4">
-                            <div>
-                                <h4 class="text-lg font-medium text-brand-blue">{{ policy_name }}</h4>
-                                {% if policy_data.description %}
-                                    <p class="text-sm text-brand-gray mt-1">{{ policy_data.description }}</p>
-                                {% endif %}
-                            </div>
-                            <div class="flex space-x-2">
-                                <span class="px-3 py-1 text-xs font-semibold rounded-full
-                                    {{ 'bg-purple-100 text-purple-800' if policy_data.remediation_action == 'enforce' 
-                                    else 'bg-blue-100 text-blue-800' }}">
-                                    {{ policy_data.remediation_action|title }}
-                                </span>
-                                <span class="px-3 py-1 text-xs font-semibold rounded-full bg-red-100 text-red-800">
-                                    {{ policy_data.total_violations }} violation(s)
-                                </span>
-                            </div>
-                        </div>
-
-                        <div class="space-y-3 divide-y divide-gray-100">
-                            {% for instance in policy_data.instances %}
-                                <div class="pt-3 first:pt-0">
-                                    <div class="bg-white rounded-lg shadow-sm overflow-hidden">
-                                        <div class="flex items-center justify-between p-4 bg-gray-50">
-                                            <div>
-                                                <div class="flex items-center">
-                                                    <span class="font-medium text-brand-blue">{{ instance.hub_name }}</span>
-                                                    <span class="mx-2 text-gray-400">•</span>
-                                                    <span class="text-sm text-gray-600">{{ instance.namespace }}</span>
-                                                </div>
-                                            </div>
-                                            <span class="text-xs bg-blue-100 text-blue-800 px-2 py-1 rounded-full">
-                                                {{ instance.violation_count }} non-compliant cluster(s)
-                                            </span>
-                                        </div>
-                                        
-                                        <div class="p-4">
-                                            <div class="space-y-3">
-                                                {% for cluster_name, cluster_data in instance.cluster_status.items() %}
-                                                    <div class="flex items-center justify-between py-2 px-3 bg-gray-50 rounded-lg">
-                                                        <span class="text-sm text-brand-gray">{{ cluster_name }}</span>
-                                                        {% if cluster_data.console_url %}
-                                                            <a href="{{ cluster_data.console_url }}" 
-                                                            target="_blank"
-                                                            class="text-sm text-brand-blue hover:text-brand-blue/80 flex items-center group">
-                                                                View Violation Message
-                                                                <svg class="w-4 h-4 ml-1 transition-transform group-hover:translate-x-0.5" 
-                                                                    fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" 
-                                                                        d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"/>
-                                                                </svg>
-                                                            </a>
-                                                        {% endif %}
-                                                    </div>
-                                                {% endfor %}
-                                            </div>
-                                        </div>
-                                    </div>
-                                </div>
-                            {% endfor %}
-                        </div>
-                    </div>
-                {% endfor %}
-            </div>
-        </div>
-    </div>
-</div>
-
-<!-- Chart Initialization Script -->
-<script>
-document.addEventListener('DOMContentLoaded', function() {
-// Donut Chart for Policy Compliance Overview
-const complianceCtx = document.getElementById('complianceChart').getContext('2d');
-new Chart(complianceCtx, {
-type: 'doughnut',
-data: {
-    labels: ['Compliant', 'Non-Compliant', 'Changed'],
-    datasets: [{
-        data: [
-            {{ comparison.summary.compliant|default(0) }},
-            {{ comparison.summary.total_noncompliant|default(0) }},
-            {{ comparison.summary.changed|default(0) }}
-        ],
-        backgroundColor: [
-            '#22C55E', // green
-            '#EF4444', // red
-            '#EAB308'  // yellow
-        ],
-        borderWidth: 0
-    }]
-},
-options: {
-    responsive: true,
-    maintainAspectRatio: false,
-    cutout: '60%',
-    plugins: {
-        legend: {
-            position: 'bottom',
-            labels: {
-                padding: 20,
-                font: {
-                    size: 12
-                }
-            }
-        },
-        tooltip: {
-            callbacks: {
-                label: function(context) {
-                    return `${context.label}: ${context.raw}`;
-                }
-            }
-        }
-    }
-}
-});
-
-// Bar Chart for Non-Compliant Policies by Prime Cluster
-const clusterCtx = document.getElementById('clusterChart').getContext('2d');
-new Chart(clusterCtx, {
-type: 'bar',
-data: {
-    labels: {{ comparison.summary.cluster_names|tojson|safe }},
-    datasets: [{
-        label: 'Non-Compliant Policies',
-        data: {{ comparison.summary.cluster_noncompliant|tojson|safe }},
-        backgroundColor: '#00658F',
-        borderWidth: 0
-    }]
-},
-options: {
-    responsive: true,
-    maintainAspectRatio: false,
-    scales: {
-        y: {
-            beginAtZero: true,
-            ticks: {
-                stepSize: 1
-            }
-        }
+# Improved client configuration with exponential backoff
+client_config = Config(
+    retries = {
+        'max_attempts': 5,  # Reduced from 10
+        'mode': 'adaptive',  # Changed to adaptive for better backoff strategy
     },
-    plugins: {
-        legend: {
-            display: false
-        },
-        tooltip: {
-            callbacks: {
-                label: function(context) {
-                    return `Non-Compliant Policies: ${context.raw}`;
-                }
-            }
-        }
-    }
-}
-});
-});
-</script>
+    connect_timeout = 5,
+    read_timeout = 10,
+    max_pool_connections = 10  # Limit concurrent connections
+)
 
-</body>
-</html>
+def set_log_handler():
+    """ Set up log handler """
+    json_handler = logging.StreamHandler(sys.stdout)
+    json_handler.setFormatter(jsonlogger.JsonFormatter('%(asctime)s %(message)s %(levelname)s'))
+    root_logger = logging.getLogger()
+    root_logger.setLevel(os.getenv('LOG_LEVEL', 'INFO'))
+    root_logger.handlers = [json_handler]
+    
+    logger = logging.getLogger(__name__)
+    return logger
+
+logger = set_log_handler()
+
+def should_upload_today():
+    """Determine if this node should upload logs today based on consistent hashing"""
+    # Create a hash based on node name and date
+    today = datetime.today().strftime('%Y-%m-%d')
+    hash_input = f"{NODE_NAME}:{today}"
+    hash_value = int(hashlib.md5(hash_input.encode()).hexdigest(), 16)
+    
+    # Determine if we should upload based on frequency
+    return hash_value % UPLOAD_FREQUENCY_HOURS == 0
+
+def apply_jitter():
+    """Apply a random jitter delay to prevent all nodes from hitting S3 simultaneously
+       The jitter is calculated based on the node name to ensure consistent spreading
+       Maximum jitter is capped at 25 minutes to ensure we complete within the 30-minute window"""
+    # Create deterministic seed from node name
+    seed_value = int(hashlib.md5(NODE_NAME.encode()).hexdigest(), 16)
+    random.seed(seed_value)
+    
+    # Generate a jitter between 0-1500 seconds (0-25 minutes)
+    # This leaves 5 minutes for execution to complete
+    max_jitter = min(JITTER_MAX_SECONDS, 1500)  # Cap at 25 minutes
+    jitter = random.randint(0, max_jitter)
+    
+    logger.info(f"Applying jitter delay of {jitter} seconds")
+    time.sleep(jitter)
+
+def compress_content(content):
+    """Compress the content if compression is enabled"""
+    if USE_COMPRESSION:
+        import gzip
+        import io
+        out = io.BytesIO()
+        with gzip.GzipFile(fileobj=out, mode="w") as f:
+            f.write(content.encode('utf-8'))
+        return out.getvalue()
+    else:
+        return content.encode('utf-8')
+
+def decompress_content(compressed_content):
+    """Decompress gzipped content"""
+    if USE_COMPRESSION:
+        import gzip
+        import io
+        with gzip.GzipFile(fileobj=io.BytesIO(compressed_content), mode="r") as f:
+            return f.read().decode('utf-8')
+    else:
+        return compressed_content.decode('utf-8')
+
+def batch_dates(dates, batch_size=BATCH_SIZE):
+    """Batch dates to reduce number of S3 operations"""
+    for i in range(0, len(dates), batch_size):
+        yield dates[i:i+batch_size]
+
+def generate_archival_log(target_dates, source_log_content):
+    """Parse log contents for multiple dates, save output to file, return filepath"""
+    combined_log_content = LOG_HEADER
+    logs_found = False
+    
+    for target_date in target_dates:
+        date_str = target_date.strftime('%Y-%m-%d') if isinstance(target_date, datetime) else target_date
+        
+        for line in source_log_content.splitlines():
+            if date_str in line:
+                combined_log_content += line + '\n'
+                logs_found = True
+    
+    if not logs_found:
+        logger.info(f"No NTP statistics logs found on host {NODE_NAME} to ship for dates {target_dates}")
+        return None
+    else:
+        # Format date range for filename
+        start_date = target_dates[0]
+        end_date = target_dates[-1]
+        if isinstance(start_date, datetime):
+            start_date = start_date.strftime('%Y-%m-%d')
+            end_date = end_date.strftime('%Y-%m-%d')
+            
+        date_range = f"{start_date}_to_{end_date}"
+        logger.info(f"Logs for date range {date_range} found on host {NODE_NAME}. Saving log...")
+        saved_file_path = save_log(combined_log_content, date_range)
+        return saved_file_path
+
+def save_log(log_content, date_range):
+    """Write content to tmpfs, then save"""
+    tmp_file = tempfile.NamedTemporaryFile(prefix=f"{NODE_NAME}_{date_range}_", suffix='.log', delete=False)
+    try:
+        compressed = USE_COMPRESSION
+        file_content = compress_content(log_content) if compressed else log_content.encode('utf-8')
+        
+        with open(tmp_file.name, "wb") as output_file:
+            output_file.write(file_content)
+            output_file_name = output_file.name
+            
+        logger.info(f"Data written to temporary file {output_file_name} "
+                  f"({'compressed' if compressed else 'uncompressed'}, {len(file_content)} bytes)")
+        return output_file_name
+    except Exception as error:
+        logger.error(f"Error saving log: {error}")
+        raise error
+
+def start_client():
+    """Create S3 client with improved connection settings"""
+    if (S3_ENDPOINT and S3_SECRET_SECRET_KEY and S3_SECRET_ACCESS_KEY):
+        try:
+            client = boto3.client(
+                service_name='s3',
+                endpoint_url=S3_ENDPOINT,
+                verify="/etc/pki/tls/certs/ca-bundle.crt",
+                aws_secret_access_key=S3_SECRET_SECRET_KEY,
+                aws_access_key_id=S3_SECRET_ACCESS_KEY,
+                config=client_config
+            )
+            return client
+        except Exception as error:
+            logger.error(f"Error starting s3 client: {error}")
+            raise error
+    else:
+        logger.error(f"Missing environment variables necessary for client startup. "
+                    f"S3_ENDPOINT: [{S3_ENDPOINT}] S3_SECRET_SECRET_KEY: [***] "
+                    f"S3_SECRET_ACCESS_KEY: [***]")
+        return None
+
+def get_s3_key_prefix():
+    """Generate a consistent S3 key prefix structure"""
+    return f"{CLUSTER_NAME}/{NODE_NAME}" if CLUSTER_NAME else NODE_NAME
+
+def upload_file_to_bucket(client, file_path, bucket_name, key_name):
+    """Upload file with exponential backoff retry logic"""
+    try:
+        logger.info(f"Uploading log to bucket [{bucket_name}] with key: [{key_name}]")
+        
+        # Determine content type and encoding based on compression
+        content_type = 'application/gzip' if USE_COMPRESSION else 'text/plain'
+        content_encoding = 'gzip' if USE_COMPRESSION else None
+        
+        extra_args = {
+            'ContentType': content_type
+        }
+        
+        if content_encoding:
+            extra_args['ContentEncoding'] = content_encoding
+            
+        # Add metadata to help with management
+        extra_args['Metadata'] = {
+            'cluster': CLUSTER_NAME if CLUSTER_NAME else 'unknown',
+            'node': NODE_NAME,
+            'compressed': str(USE_COMPRESSION).lower(),
+            'created': datetime.now().isoformat()
+        }
+            
+        upload_response = client.upload_file(
+            file_path,
+            bucket_name,
+            key_name,
+            ExtraArgs=extra_args
+        )
+        
+        logger.info("Upload successful")
+        return upload_response
+    except Exception as error:
+        logger.error(f"Error uploading file to s3: {error}")
+        raise error
+
+def get_log_keys_for_date_range(client, start_date, end_date):
+    """Get log keys for a date range"""
+    prefix = get_s3_key_prefix()
+    logger.info(f"Getting log keys with prefix {prefix} for date range {start_date} to {end_date}")
+    
+    try:
+        # Use pagination to handle large results more efficiently
+        paginator = client.get_paginator('list_objects_v2')
+        pages = paginator.paginate(
+            Bucket=BUCKET_NAME,
+            Prefix=prefix
+        )
+        
+        keys = []
+        for page in pages:
+            if 'Contents' in page:
+                for key_data in page['Contents']:
+                    key = key_data['Key']
+                    # Check if the key is within our date range
+                    if is_key_in_date_range(key, start_date, end_date):
+                        keys.append(key)
+        
+        logger.debug(f"Found {len(keys)} log keys in S3")
+        return keys
+    except Exception as error:
+        logger.error(f"Error getting log keys: {error}")
+        raise error
+
+def is_key_in_date_range(key, start_date, end_date):
+    """Check if a S3 key name contains a date that falls within the given range"""
+    # Example key format: clustername/nodename-YYYY-MM-DD-timestamp
+    parts = key.split('-')
+    if len(parts) < 2:
+        return False
+    
+    try:
+        # Try to extract the date part (assuming format YYYY-MM-DD)
+        date_part = parts[-3] if len(parts) >= 3 else None
+        if date_part and len(date_part) == 10:  # YYYY-MM-DD is 10 chars
+            key_date = datetime.strptime(date_part, '%Y-%m-%d').date()
+            start = datetime.strptime(start_date, '%Y-%m-%d').date() if isinstance(start_date, str) else start_date.date()
+            end = datetime.strptime(end_date, '%Y-%m-%d').date() if isinstance(end_date, str) else end_date.date()
+            return start <= key_date <= end
+    except (ValueError, IndexError):
+        pass
+    
+    return False
+
+def get_log_content_from_s3(client, keys):
+    """Get and combine log content from multiple S3 keys"""
+    if not keys:
+        return ""
+        
+    united_content = ""
+    for key in keys:
+        try:
+            response = client.get_object(Bucket=BUCKET_NAME, Key=key)
+            content = response['Body'].read()
+            
+            # Check if content is compressed (either by Content-Encoding or our own logic)
+            is_compressed = (response.get('ContentEncoding') == 'gzip' or 
+                            response.get('ContentType') == 'application/gzip' or
+                            key.endswith('.gz'))
+            
+            if is_compressed:
+                decoded_content = decompress_content(content)
+            else:
+                decoded_content = content.decode('utf-8')
+                
+            united_content += decoded_content
+            
+        except Exception as error:
+            logger.warning(f"Error retrieving S3 object {key}: {error}")
+            continue
+            
+    return united_content
+
+def get_host_logs_content():
+    """Get all log content from host"""
+    combined_content = ""
+    for filename in os.listdir(CHRONY_STATS_DIR):
+        if filename.startswith("."):
+            continue  # Skip hidden files
+            
+        full_path = os.path.join(CHRONY_STATS_DIR, filename)
+        try:
+            with open(full_path, 'r') as f:
+                combined_content += f.read()
+        except Exception as error:
+            logger.warning(f"Error reading log file {full_path}: {error}")
+            
+    return combined_content
+
+def get_deduped_host_logs(united_s3_logs):
+    """
+    Get logs from host that don't exist in S3 yet
+    Modified to read whole files at once for better performance
+    """
+    # If we have no S3 logs yet, return all host logs
+    if not united_s3_logs:
+        return get_host_logs_content()
+    
+    # Create a set of lines from S3 for faster lookups
+    s3_lines = set(united_s3_logs.splitlines())
+    
+    deduped_lines = []
+    for filename in os.listdir(CHRONY_STATS_DIR):
+        if filename.startswith("."):
+            continue  # Skip hidden files
+            
+        full_path = os.path.join(CHRONY_STATS_DIR, filename)
+        try:
+            with open(full_path, 'r') as f:
+                for line in f:
+                    # Only add lines that aren't already in S3
+                    clean_line = line.rstrip('\n')
+                    if clean_line and clean_line not in s3_lines:
+                        deduped_lines.append(clean_line)
+        except Exception as error:
+            logger.warning(f"Error reading log file {full_path}: {error}")
+    
+    return '\n'.join(deduped_lines)
+
+def get_date_range_to_process():
+    """Determine the date range that needs to be processed"""
+    try:
+        # Get the oldest date in local logs
+        oldest_date = get_oldest_log_line_date()
+        if not oldest_date:
+            logger.warning("No log dates found on host")
+            return []
+            
+        # Calculate all dates from oldest to today
+        today = datetime.today().date()
+        date_range = []
+        current = oldest_date.date()
+        
+        while current <= today:
+            date_range.append(current)
+            current += timedelta(days=1)
+            
+        return date_range
+    except Exception as error:
+        logger.error(f"Error determining date range: {error}")
+        return []
+
+def parse_date_from_filename(filename):
+    """Parse date from a log filename"""
+    fn_s = filename.split('-')
+    is_rotation_log = len(fn_s) > 1
+    if is_rotation_log:
+        date = fn_s[1]
+        if len(date) >= 8:  # Make sure we have enough characters
+            try:
+                month = date[4:6]
+                day = date[6:8]
+                year = date[0:4]
+                return datetime.strptime(month + '-' + day + '-' + year, '%m-%d-%Y')
+            except ValueError:
+                pass
+    return None
+
+def get_oldest_log_file():
+    """Returns the path to the oldest log file"""
+    log_files = [f for f in os.listdir(CHRONY_STATS_DIR) if not f.startswith('.')]
+    if not log_files:
+        logger.error("No ntp logs found on host!")
+        return None
+    if len(log_files) == 1:
+        return os.path.join(CHRONY_STATS_DIR, log_files[0])
+    
+    oldest = None
+    full_fp = None
+    for log in log_files:
+        file_date = parse_date_from_filename(log)
+        if file_date:
+            if oldest is None:
+                oldest = log
+                full_fp = os.path.join(CHRONY_STATS_DIR, oldest)
+            elif file_date < parse_date_from_filename(oldest):
+                oldest = log
+                full_fp = os.path.join(CHRONY_STATS_DIR, oldest)
+    return full_fp
+
+def get_oldest_log_line_date():
+    """Find the oldest date within log files"""
+    full_fp = get_oldest_log_file()
+    oldest_date_found = None
+    if full_fp:
+        try:
+            with open(full_fp) as f:
+                for line in f:
+                    try:
+                        if line.strip() and line.strip() != LOG_HEADER_BORDER and line.strip() != LOG_HEADER_COLUMNS.strip():
+                            split = line.split()
+                            if len(split) > 0:
+                                # Try to parse the date (first column)
+                                try:
+                                    log_line_date = datetime.strptime(split[0], '%Y-%m-%d')
+                                    if oldest_date_found is None or log_line_date < oldest_date_found:
+                                        oldest_date_found = log_line_date
+                                except ValueError:
+                                    # Not a date in expected format, skip
+                                    pass
+                    except Exception as inner_error:
+                        logger.debug(f"Error parsing line in log file: {inner_error}")
+                        continue
+        except Exception as error:
+            logger.error(f"Error reading log file {full_fp}: {error}")
+    
+    if not oldest_date_found:
+        # Fallback to 30 days ago if we couldn't find a date
+        oldest_date_found = datetime.now() - timedelta(days=30)
+        logger.warning(f"Could not determine oldest date, using fallback: {oldest_date_found}")
+    else:
+        logger.info(f"Oldest date found in NTP statistics log: {oldest_date_found}")
+        
+    return oldest_date_found
+
+def run():
+    """Main execution with optimizations to reduce S3 API load"""
+    # Apply random jitter to spread out requests
+    apply_jitter()
+    
+    # Check if we should upload today based on frequency
+    if not should_upload_today():
+        logger.info(f"Skipping upload for today based on configured frequency (every {UPLOAD_FREQUENCY_HOURS} hours)")
+        return
+    
+    # Determine date range to process
+    all_dates = get_date_range_to_process()
+    if not all_dates:
+        logger.warning("No dates to process, exiting")
+        return
+        
+    logger.info(f"Processing {len(all_dates)} days of logs from {all_dates[0]} to {all_dates[-1]}")
+    
+    # Start S3 client
+    client = start_client()
+    if not client:
+        logger.error("Failed to initialize S3 client")
+        return
+        
+    # Process dates in batches
+    for date_batch in batch_dates(all_dates):
+        start_date = date_batch[0]
+        end_date = date_batch[-1]
+        
+        # Format dates for logging
+        start_str = start_date.strftime('%Y-%m-%d') if isinstance(start_date, datetime) else start_date
+        end_str = end_date.strftime('%Y-%m-%d') if isinstance(end_date, datetime) else end_date
+        
+        logger.info(f"Processing batch from {start_str} to {end_str}")
+        
+        # Get existing S3 logs for this date range
+        log_keys = get_log_keys_for_date_range(client, start_str, end_str)
+        
+        # Get content from S3 logs
+        s3_log_content = get_log_content_from_s3(client, log_keys)
+        
+        # Get new content from host logs (deduped against S3)
+        host_logs_to_ship = get_deduped_host_logs(s3_log_content)
+        
+        if not host_logs_to_ship:
+            logger.info(f"No new logs to ship for date range {start_str} to {end_str}")
+            continue
+            
+        # Generate archive log for the batch
+        output_fp = generate_archival_log(date_batch, host_logs_to_ship)
+        
+        if output_fp:
+            # Create a unique key with date range and timestamp
+            timestamp = int(datetime.now().timestamp())
+            s3_key = f"{get_s3_key_prefix()}/{start_str}_to_{end_str}_{timestamp}"
+            if USE_COMPRESSION:
+                s3_key += ".gz"
+                
+            # Upload to S3
+            try:
+                upload_file_to_bucket(client, output_fp, BUCKET_NAME, s3_key)
+                # Clean up temp file
+                os.unlink(output_fp)
+            except Exception as error:
+                logger.error(f"Failed to upload batch {start_str} to {end_str}: {error}")
+                # Continue with next batch rather than failing entirely
+                continue
+
+if __name__ == "__main__":
+    try:
+        run()
+    except Exception as e:
+        logger.error(f"Unhandled exception in main execution: {e}")
+        sys.exit(1)
