@@ -229,6 +229,11 @@ def upload_file_to_bucket(client, file_path, bucket_name, key_name):
 def get_log_keys_for_date_range(client, start_date, end_date):
     """Get log keys for a date range"""
     prefix = get_s3_key_prefix()
+    
+    # Convert dates to strings if they're not already
+    start_date_str = start_date.strftime('%Y-%m-%d') if hasattr(start_date, 'strftime') else start_date
+    end_date_str = end_date.strftime('%Y-%m-%d') if hasattr(end_date, 'strftime') else end_date
+    
     logger.info(f"Getting log keys with prefix {prefix} for date range {start_date} to {end_date}")
     
     try:
