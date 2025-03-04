@@ -73,16 +73,6 @@ def set_log_handler():
 
 logger = set_log_handler()
 
-def should_upload_today():
-    """Determine if this node should upload logs today based on consistent hashing"""
-    # Create a hash based on node name and date
-    today = datetime.today().strftime('%Y-%m-%d')
-    hash_input = f"{NODE_NAME}:{today}"
-    hash_value = int(hashlib.md5(hash_input.encode()).hexdigest(), 16)
-    
-    # Determine if we should upload based on frequency
-    return hash_value % UPLOAD_FREQUENCY_HOURS == 0
-
 def apply_jitter():
     """Apply a random jitter delay to prevent all nodes from hitting S3 simultaneously
        The jitter is calculated based on the node name to ensure consistent spreading
@@ -459,11 +449,6 @@ def run():
     """Main execution with optimizations to reduce S3 API load"""
     # Apply random jitter to spread out requests
     apply_jitter()
-    
-    # Check if we should upload today based on frequency
-    if not should_upload_today():
-        logger.info(f"Skipping upload for today based on configured frequency (every {UPLOAD_FREQUENCY_HOURS} hours)")
-        return
     
     # Determine date range to process
     all_dates = get_date_range_to_process()
