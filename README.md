@@ -355,25 +355,44 @@ def get_oldest_log_line_date():
     if full_fp:
         with open(full_fp) as f:
             for line in f.readlines():
+                # Skip empty lines and header lines
+                line = line.strip()
+                if not line or line.startswith('=') or "IP Address" in line or "Date" in line and "Time" in line:
+                    continue
+                
                 try:
-                    log_line_date = None
-                    if line != '' and line != '\n' and line.strip() != LOG_HEADER_BORDER and line.strip() != LOG_HEADER_COLUMNS.strip():
-                        split = line.split(' ')
-                        if len(split) > 0:
-                            log_line_date = datetime.strptime(split[0], '%Y-%m-%d')
-                        if oldest_date_found is None:
-                            # If first record found, save it as oldest
-                            oldest_date_found = log_line_date
-                        else:
-                            # We have two dates to compare, save the oldest
-                            if log_line_date is not None and log_line_date < oldest_date_found:
-                                oldest_date_found = log_line_date
-                except ValueError as error:
-                    logger.error(f"Error finding oldest date in log files: {error}")
-                    raise error
+                    # Try to extract and parse the date from the beginning of the line
+                    split = line.split()
+                    if len(split) >= 1:
+                        # Only try to parse if the first item looks like a date (YYYY-MM-DD)
+                        date_str = split[0]
+                        if len(date_str) == 10 and date_str[4] == '-' and date_str[7] == '-':
+                            try:
+                                log_line_date = datetime.strptime(date_str, '%Y-%m-%d')
+                                
+                                # Compare with current oldest date
+                                if oldest_date_found is None or log_line_date < oldest_date_found:
+                                    oldest_date_found = log_line_date
+                                    logger.debug(f"Found date: {log_line_date} in line: {line[:30]}...")
+                            except ValueError:
+                                # Skip lines that don't parse as dates but don't fail the whole process
+                                logger.debug(f"Skipping non-date line: {line[:30]}...")
+                                continue
+                except Exception as e:
+                    # Log the error but continue processing other lines
+                    logger.warning(f"Error processing line: {line[:30]}... - {str(e)}")
+                    continue
+                    
+        if oldest_date_found is None:
+            # If no valid dates found, default to recent date to avoid processing too much history
+            oldest_date_found = datetime.now() - timedelta(days=7)
+            logger.warning(f"No valid dates found in logs, defaulting to {oldest_date_found}")
     else:
         logger.error(f"No logs files to parse for oldest date on host {NODE_NAME}")
-    logger.info(f"Oldest date found in NTP statistics log on host {NODE_NAME}: [{oldest_date_found}] ")
+        # Default to 7 days ago to avoid errors in subsequent code
+        oldest_date_found = datetime.now() - timedelta(days=7)
+        
+    logger.info(f"Oldest date found in NTP statistics log on host {NODE_NAME}: [{oldest_date_found}]")
     return oldest_date_found
 
 # Original run function - replaced by optimized version
