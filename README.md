@@ -2,21 +2,19 @@
 # This script is run on MKS Nodes, parses log files in
 # /var/log/chrony/ up until the oldest date found
 # and exports the data to a s3 bucket for FINRA compliance.
-# Optimized to reduce S3 API load across large clusters
 ##
 
+# import ms.version
 import logging
 import logging.handlers as handlers
 import os
+import shutil
 import sys
 import tempfile
 import time
 import urllib3
 import json
-import hashlib
-import random
 from datetime import datetime, timedelta
-from threading import Timer
 from requests.exceptions import SSLError
 from pythonjsonlogger import jsonlogger
 
@@ -31,33 +29,23 @@ import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
 
-# Environment variables
 CHRONY_STATS_DIR = os.environ.get("CHRONY_STATS_DIR", "/host/var/log/chrony")
 NODE_NAME = os.environ.get("NODE_NAME", "")
-CLUSTER_NAME = os.environ.get("CLUSTER_NAME", "")  # Added cluster name for organization
 S3_ENDPOINT = os.environ.get("S3_ENDPOINT_URL", "")
 S3_SECRET_SECRET_KEY = os.environ.get("S3_SECRET_SECRET_KEY", "")
 S3_SECRET_ACCESS_KEY = os.environ.get("S3_SECRET_ACCESS_KEY", "")
 BUCKET_NAME = os.environ.get("BUCKET_NAME", "")
-# New env variables for optimizations
-BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "5"))  # Number of days to process in one batch
-JITTER_MAX_SECONDS = int(os.environ.get("JITTER_MAX_SECONDS", "300"))  # Max seconds to delay execution
-UPLOAD_FREQUENCY_HOURS = int(os.environ.get("UPLOAD_FREQUENCY_HOURS", "12"))  # How often to upload (hours)
-USE_COMPRESSION = os.environ.get("USE_COMPRESSION", "true").lower() == "true"  # Whether to compress logs
+MAX_DAYS_BACK = int(os.environ.get("MAX_DAYS_BACK", "30"))  # Default to 30 days
 
 LOG_HEADER_BORDER = "======================================================================================================"
 LOG_HEADER_COLUMNS = "    Date (UTC) Time      IP Address     Std dev'n Est offset  Offset sd  Diff freq   Est skew  Stress  Ns  Bs  Nr  Asym"
 LOG_HEADER = LOG_HEADER_BORDER + '\n' + LOG_HEADER_COLUMNS + '\n' + LOG_HEADER_BORDER + '\n'
 
-# Improved client configuration with exponential backoff
 client_config = Config(
     retries = {
-        'max_attempts': 5,  # Reduced from 10
-        'mode': 'adaptive',  # Changed to adaptive for better backoff strategy
-    },
-    connect_timeout = 5,
-    read_timeout = 10,
-    max_pool_connections = 10  # Limit concurrent connections
+        'max_attempts': 10,
+        'mode': 'standard'
+    }
 )
 
 def set_log_handler():
@@ -73,98 +61,46 @@ def set_log_handler():
 
 logger = set_log_handler()
 
-def apply_jitter():
-    """Apply a random jitter delay to prevent all nodes from hitting S3 simultaneously
-       The jitter is calculated based on the node name to ensure consistent spreading
-       Maximum jitter is capped at 25 minutes to ensure we complete within the 30-minute window"""
-    # Create deterministic seed from node name
-    seed_value = int(hashlib.md5(NODE_NAME.encode()).hexdigest(), 16)
-    random.seed(seed_value)
-    
-    # Generate a jitter between 0-1500 seconds (0-25 minutes)
-    # This leaves 5 minutes for execution to complete
-    max_jitter = min(JITTER_MAX_SECONDS, 1500)  # Cap at 25 minutes
-    jitter = random.randint(0, max_jitter)
-    
-    logger.info(f"Applying jitter delay of {jitter} seconds")
-    time.sleep(jitter)
-
-def compress_content(content):
-    """Compress the content if compression is enabled"""
-    if USE_COMPRESSION:
-        import gzip
-        import io
-        out = io.BytesIO()
-        with gzip.GzipFile(fileobj=out, mode="w") as f:
-            f.write(content.encode('utf-8'))
-        return out.getvalue()
-    else:
-        return content.encode('utf-8')
-
-def decompress_content(compressed_content):
-    """Decompress gzipped content"""
-    if USE_COMPRESSION:
-        import gzip
-        import io
-        with gzip.GzipFile(fileobj=io.BytesIO(compressed_content), mode="r") as f:
-            return f.read().decode('utf-8')
-    else:
-        return compressed_content.decode('utf-8')
-
-def batch_dates(dates, batch_size=BATCH_SIZE):
-    """Batch dates to reduce number of S3 operations"""
-    for i in range(0, len(dates), batch_size):
-        yield dates[i:i+batch_size]
-
-def generate_archival_log(target_dates, source_log_content):
-    """Parse log contents for multiple dates, save output to file, return filepath"""
-    combined_log_content = LOG_HEADER
-    logs_found = False
-    
-    for target_date in target_dates:
-        date_str = target_date.strftime('%Y-%m-%d') if isinstance(target_date, datetime) else target_date
-        
-        for line in source_log_content.splitlines():
-            if date_str in line:
-                combined_log_content += line + '\n'
-                logs_found = True
-    
-    if not logs_found:
-        logger.info(f"No NTP statistics logs found on host {NODE_NAME} to ship for dates {target_dates}")
+def generate_archival_log(target_date, source_log_content):
+    """ Parse log contents, save output to file, return filepath """
+    log_content = parse_source_log(target_date, source_log_content)
+    if log_content == LOG_HEADER:
+        logger.info(f"No NTP statistics logs found on host {NODE_NAME} to ship for date {target_date}")
         return None
     else:
-        # Format date range for filename
-        start_date = target_dates[0]
-        end_date = target_dates[-1]
-        if isinstance(start_date, datetime):
-            start_date = start_date.strftime('%Y-%m-%d')
-            end_date = end_date.strftime('%Y-%m-%d')
-            
-        date_range = f"{start_date}_to_{end_date}"
-        logger.info(f"Logs for date range {date_range} found on host {NODE_NAME}. Saving log...")
-        saved_file_path = save_log(combined_log_content, date_range)
+        logger.info(f"Logs for date {target_date} found on host {NODE_NAME} found. Saving log...")
+        saved_file_path = save_log(log_content, target_date)
         return saved_file_path
 
-def save_log(log_content, date_range):
-    """Write content to tmpfs, then save"""
-    tmp_file = tempfile.NamedTemporaryFile(prefix=f"{NODE_NAME}_{date_range}_", suffix='.log', delete=False)
+def parse_source_log(target_date, source_log_content):
+    """ Parse the mounted ntp log for records of the target_date, formatted with proper log headers """
+    log_content = LOG_HEADER
+    
+    for line in source_log_content.splitlines():
+        if target_date in line:
+            log_content += line+'\n'
+    
+    if log_content == LOG_HEADER:
+        logger.info("No logs found for " + target_date)
+    else:
+        logger.info("Logs found for " + target_date)
+    return log_content
+
+def save_log(log_content, target_date):
+    """ Write content to tmpfs, then save """
+    tmp_file = tempfile.NamedTemporaryFile(prefix=NODE_NAME+target_date, suffix='.log')
     try:
-        compressed = USE_COMPRESSION
-        file_content = compress_content(log_content) if compressed else log_content.encode('utf-8')
-        
-        with open(tmp_file.name, "wb") as output_file:
-            output_file.write(file_content)
+        with open(tmp_file.name, "w+") as output_file:
+            output_file.write(log_content)
+            output_file.seek(0)
             output_file_name = output_file.name
-            
-        logger.info(f"Data written to temporary file {output_file_name} "
-                  f"({'compressed' if compressed else 'uncompressed'}, {len(file_content)} bytes)")
-        return output_file_name
+            logger.info("Data written to temporary file. It is ready to be shipped to s3 as file: [{}]".format(output_file_name))
+            return output_file_name
     except Exception as error:
-        logger.error(f"Error saving log: {error}")
+        logger.error("Error saving log: [{}]".format(error))
         raise error
 
 def start_client():
-    """Create S3 client with improved connection settings"""
     if (S3_ENDPOINT and S3_SECRET_SECRET_KEY and S3_SECRET_ACCESS_KEY):
         try:
             client = boto3.client(
@@ -177,226 +113,221 @@ def start_client():
             )
             return client
         except Exception as error:
-            logger.error(f"Error starting s3 client: {error}")
+            logger.error("Error starting s3 client: [{}]".format(error))
             raise error
     else:
-        logger.error(f"Missing environment variables necessary for client startup. "
-                    f"S3_ENDPOINT: [{S3_ENDPOINT}] S3_SECRET_SECRET_KEY: [***] "
-                    f"S3_SECRET_ACCESS_KEY: [***]")
-        return None
-
-def get_s3_key_prefix():
-    """Generate a consistent S3 key prefix structure"""
-    return f"{CLUSTER_NAME}/{NODE_NAME}" if CLUSTER_NAME else NODE_NAME
+        logger.error("Missing environment variables necessary for client startup. S3_ENDPOINT: [{}] S3_SECRET_SECRET_KEY: [{}]  S3_SECRET_ACCESS_KEY: [{}]".format(S3_ENDPOINT,S3_SECRET_SECRET_KEY,S3_SECRET_ACCESS_KEY))
 
 def upload_file_to_bucket(client, file_path, bucket_name, key_name):
-    """Upload file with exponential backoff retry logic"""
+    """ Attempt upload """
     try:
-        logger.info(f"Uploading log to bucket [{bucket_name}] with key: [{key_name}]")
-        
-        # Determine content type and encoding based on compression
-        content_type = 'application/gzip' if USE_COMPRESSION else 'text/plain'
-        content_encoding = 'gzip' if USE_COMPRESSION else None
-        
-        extra_args = {
-            'ContentType': content_type
-        }
-        
-        if content_encoding:
-            extra_args['ContentEncoding'] = content_encoding
-            
-        # Add metadata to help with management
-        extra_args['Metadata'] = {
-            'cluster': CLUSTER_NAME if CLUSTER_NAME else 'unknown',
-            'node': NODE_NAME,
-            'compressed': str(USE_COMPRESSION).lower(),
-            'created': datetime.now().isoformat()
-        }
-            
+        logger.info("Attempting to upload log to bucket [{}] with key: [{}]".format(bucket_name, key_name))
         upload_response = client.upload_file(
             file_path,
             bucket_name,
-            key_name,
-            ExtraArgs=extra_args
+            key_name
         )
-        
-        logger.info("Upload successful")
+        logger.info("Response received from s3: [{}]".format(upload_response))
         return upload_response
     except Exception as error:
-        logger.error(f"Error uploading file to s3: {error}")
+        logger.error("Error uploading file to s3: [{}]".format(error))
         raise error
 
-def get_log_keys_for_date_range(client, start_date, end_date):
-    """Get log keys for a date range"""
-    prefix = get_s3_key_prefix()
-    
-    # Convert dates to strings if they're not already
-    start_date_str = start_date.strftime('%Y-%m-%d') if hasattr(start_date, 'strftime') else start_date
-    end_date_str = end_date.strftime('%Y-%m-%d') if hasattr(end_date, 'strftime') else end_date
-    
-    logger.info(f"Getting log keys with prefix {prefix} for date range {start_date} to {end_date}")
-    
+def try_get_object(client, object_key):
+    if client and object_key:
+        try:
+            get_obj_response = client.get_object(
+                Bucket=BUCKET_NAME,
+                Key=object_key
+            )
+            return get_obj_response
+        except Exception as error:
+            logger.error("Error getting object from bucket: [{}]".format(error))
+            raise error
+
+# Original function - kept for backward compatibility
+def get_log_keys(client, target_date):
+    """ Get logs shipped from this cluster-node """
+    logger.info("Getting log keys...")
     try:
-        # Use pagination to handle large results more efficiently
-        paginator = client.get_paginator('list_objects_v2')
-        pages = paginator.paginate(
+        response = client.list_objects_v2(
             Bucket=BUCKET_NAME,
-            Prefix=prefix
+            Prefix=NODE_NAME+'-'+target_date
         )
-        
+        logger.debug("S3 log keys response: [{}]".format(response))
         keys = []
-        for page in pages:
-            if 'Contents' in page:
-                for key_data in page['Contents']:
-                    key = key_data['Key']
-                    # Check if the key is within our date range
-                    if is_key_in_date_range(key, start_date, end_date):
-                        keys.append(key)
-        
-        logger.debug(f"Found {len(keys)} log keys in S3")
+        for key_data in response.get("Contents", []):
+            keys.append(key_data["Key"])
         return keys
     except Exception as error:
-        logger.error(f"Error getting log keys: {error}")
+        logger.error("Error getting cluster-node ntps logs: [{}]".format(error))
         raise error
 
-def is_key_in_date_range(key, start_date, end_date):
-    """Check if a S3 key name contains a date that falls within the given range"""
-    # Example key format: clustername/nodename-YYYY-MM-DD-timestamp
-    parts = key.split('-')
-    if len(parts) < 2:
-        return False
+# New optimized function for batch retrieval of keys
+def get_log_keys_batch(client, target_dates):
+    """
+    Get logs shipped from this cluster-node for multiple dates in fewer API calls
+    Uses prefixes and pagination to reduce API calls
+    """
+    logger.info("Getting log keys for multiple dates...")
+    all_keys = {}
     
-    try:
-        # Try to extract the date part (assuming format YYYY-MM-DD)
-        date_part = parts[-3] if len(parts) >= 3 else None
-        if date_part and len(date_part) == 10:  # YYYY-MM-DD is 10 chars
-            key_date = datetime.strptime(date_part, '%Y-%m-%d').date()
-            start = datetime.strptime(start_date, '%Y-%m-%d').date() if isinstance(start_date, str) else start_date.date()
-            end = datetime.strptime(end_date, '%Y-%m-%d').date() if isinstance(end_date, str) else end_date.date()
-            return start <= key_date <= end
-    except (ValueError, IndexError):
-        pass
+    # Group dates by month to reduce number of API calls
+    date_prefixes = {}
+    for date in target_dates:
+        formatted_date = datetime.strftime(date, '%Y-%m-%d')
+        month_year = formatted_date[:7]  # Get YYYY-MM portion
+        if month_year not in date_prefixes:
+            date_prefixes[month_year] = []
+        date_prefixes[month_year].append(formatted_date)
     
-    return False
-
-def get_log_content_from_s3(client, keys):
-    """Get and combine log content from multiple S3 keys"""
-    if not keys:
-        return ""
-        
-    united_content = ""
-    for key in keys:
+    # For each month, make one API call instead of one per day
+    for month_year, dates in date_prefixes.items():
         try:
-            response = client.get_object(Bucket=BUCKET_NAME, Key=key)
-            content = response['Body'].read()
+            # Use month prefix for query instead of specific day
+            prefix = f"{NODE_NAME}-{month_year}"
+            paginator = client.get_paginator('list_objects_v2')
             
-            # Check if content is compressed (either by Content-Encoding or our own logic)
-            is_compressed = (response.get('ContentEncoding') == 'gzip' or 
-                            response.get('ContentType') == 'application/gzip' or
-                            key.endswith('.gz'))
+            # Use pagination to handle large response sets
+            for page in paginator.paginate(Bucket=BUCKET_NAME, Prefix=prefix):
+                if 'Contents' not in page:
+                    continue
+                    
+                for key_data in page.get('Contents', []):
+                    key = key_data["Key"]
+                    # Filter keys by specific dates after retrieving them
+                    for date in dates:
+                        if f"{NODE_NAME}-{date}" in key:
+                            if date not in all_keys:
+                                all_keys[date] = []
+                            all_keys[date].append(key)
             
-            if is_compressed:
-                decoded_content = decompress_content(content)
-            else:
-                decoded_content = content.decode('utf-8')
+        except Exception as error:
+            logger.error(f"Error getting cluster-node ntps logs for {month_year}: {error}")
+            raise error
+    
+    return all_keys
+
+# New function to efficiently get metadata
+def get_log_metadata(client, all_keys):
+    """
+    Instead of downloading all logs, get metadata and track what we already have
+    Returns a set of unique log entry identifiers (date + IP + timestamp)
+    """
+    existing_log_entries = set()
+    download_count = 0
+    max_downloads = 10  # Limit number of files to download for sampling
+    
+    # Sample approach: only download a subset of files to determine patterns
+    for date, keys in all_keys.items():
+        for key in keys:
+            if download_count >= max_downloads:
+                break
                 
-            united_content += decoded_content
-            
-        except Exception as error:
-            logger.warning(f"Error retrieving S3 object {key}: {error}")
-            continue
-            
-    return united_content
+            try:
+                log_s3_response = client.get_object(Bucket=BUCKET_NAME, Key=key)
+                log_content = log_s3_response.get("Body").read().decode('utf-8')
+                
+                # Extract unique identifiers from each log line
+                for line in log_content.splitlines():
+                    if line and not line.startswith('=') and "IP Address" not in line:
+                        # Parse the line to get a unique identifier
+                        parts = line.split()
+                        if len(parts) >= 3:
+                            # Use date + time + IP as unique identifier
+                            entry_id = f"{parts[0]}_{parts[1]}_{parts[2]}"
+                            existing_log_entries.add(entry_id)
+                
+                download_count += 1
+            except Exception as error:
+                logger.error(f"Error processing S3 log {key}: {error}")
+                continue
+    
+    logger.info(f"Identified {len(existing_log_entries)} unique log entries from {download_count} sample files")
+    return existing_log_entries
 
-def get_host_logs_content():
-    """Get all log content from host"""
-    combined_content = ""
-    for filename in os.listdir(CHRONY_STATS_DIR):
-        if filename.startswith("."):
-            continue  # Skip hidden files
-            
-        full_path = os.path.join(CHRONY_STATS_DIR, filename)
-        try:
-            with open(full_path, 'r') as f:
-                combined_content += f.read()
-        except Exception as error:
-            logger.warning(f"Error reading log file {full_path}: {error}")
-            
-    return combined_content
+# Original function - will be replaced
+def get_united_s3_logs(client, log_keys):
+    """
+    Get all logs from S3 using keys from log_keys
+    Collect them and return them
+    """
+    united_s3_logs = ""
+    for log_key_date in log_keys:
+        if log_key_date:
+            for log_key in log_key_date:
+                log_s3_response = try_get_object(client, log_key)
+                united_s3_logs += log_s3_response.get("Body").read().decode('utf-8')
+    return united_s3_logs
 
+# Original function - will be replaced
 def get_deduped_host_logs(united_s3_logs):
     """
-    Get logs from host that don't exist in S3 yet
-    Modified to read whole files at once for better performance
+    Collect all NTP stat logs from the Chrony stats dir,
+    go through each line in each log,
+    collect lines that are not in s3 and return them.
     """
-    # If we have no S3 logs yet, return all host logs
-    if not united_s3_logs:
-        return get_host_logs_content()
-    
-    # Create a set of lines from S3 for faster lookups
-    s3_lines = set(united_s3_logs.splitlines())
-    
-    deduped_lines = []
-    for filename in os.listdir(CHRONY_STATS_DIR):
-        if filename.startswith("."):
-            continue  # Skip hidden files
-            
-        full_path = os.path.join(CHRONY_STATS_DIR, filename)
-        try:
-            with open(full_path, 'r') as f:
-                for line in f:
-                    # Only add lines that aren't already in S3
-                    clean_line = line.rstrip('\n')
-                    if clean_line and clean_line not in s3_lines:
-                        deduped_lines.append(clean_line)
-        except Exception as error:
-            logger.warning(f"Error reading log file {full_path}: {error}")
-    
-    return '\n'.join(deduped_lines)
+    united_host_logs = ''
+    for fp in os.listdir(CHRONY_STATS_DIR):
+        full_fp = os.path.join(CHRONY_STATS_DIR, fp)
+        with open(full_fp) as f:
+            f.seek(0)
+            for line in f:
+                if line not in united_s3_logs:
+                    united_host_logs += line
+    return united_host_logs
 
-def get_date_range_to_process():
-    """Determine the date range that needs to be processed"""
-    try:
-        # Get the oldest date in local logs
-        oldest_date = get_oldest_log_line_date()
-        if not oldest_date:
-            logger.warning("No log dates found on host")
-            return []
-            
-        # Calculate all dates from oldest to today
-        today = datetime.today().date()
-        date_range = []
-        current = oldest_date.date()
-        
-        while current <= today:
-            date_range.append(current)
-            current += timedelta(days=1)
-            
-        return date_range
-    except Exception as error:
-        logger.error(f"Error determining date range: {error}")
-        return []
+# New optimized function for deduplication
+def get_deduped_host_logs_efficient(existing_entries):
+    """
+    More efficient deduplication using set operations instead of string contains
+    """
+    deduped_logs = []
+    entry_count = 0
+    duplicate_count = 0
+    
+    # Add header to output
+    deduped_logs.append(LOG_HEADER.strip())
+    
+    for fp in os.listdir(CHRONY_STATS_DIR):
+        full_fp = os.path.join(CHRONY_STATS_DIR, fp)
+        with open(full_fp) as f:
+            for line in f:
+                # Skip header lines
+                if line.strip() and not line.startswith('=') and "IP Address" not in line:
+                    parts = line.split()
+                    if len(parts) >= 3:
+                        entry_id = f"{parts[0]}_{parts[1]}_{parts[2]}"
+                        entry_count += 1
+                        
+                        # If entry not in our existing set, add it to output
+                        if entry_id not in existing_entries:
+                            deduped_logs.append(line.strip())
+                        else:
+                            duplicate_count += 1
+    
+    logger.info(f"Processed {entry_count} log entries, found {duplicate_count} duplicates")
+    return '\n'.join(deduped_logs)
 
 def parse_date_from_filename(filename):
-    """Parse date from a log filename"""
     fn_s = filename.split('-')
     is_rotation_log = len(fn_s) > 1
     if is_rotation_log:
         date = fn_s[1]
-        if len(date) >= 8:  # Make sure we have enough characters
-            try:
-                month = date[4:6]
-                day = date[6:8]
-                year = date[0:4]
-                return datetime.strptime(month + '-' + day + '-' + year, '%m-%d-%Y')
-            except ValueError:
-                pass
-    return None
+        month = date[4:6]
+        day = date[6:8]
+        year = date[0:4]
+        return datetime.strptime(month + '-' + day + '-' + year, '%m-%d-%Y')
+    else:
+        return None
 
 def get_oldest_log_file():
-    """Returns the path to the oldest log file"""
-    log_files = [f for f in os.listdir(CHRONY_STATS_DIR) if not f.startswith('.')]
-    if not log_files:
+    """ Returns None if there are no log files.
+    Finds and returns the path to the
+    log with the oldest date within
+    """
+    log_files = [f for f in os.listdir(CHRONY_STATS_DIR)]
+    if len(log_files) == 0:
         logger.error("No ntp logs found on host!")
         return None
     if len(log_files) == 1:
@@ -407,115 +338,151 @@ def get_oldest_log_file():
     for log in log_files:
         file_date = parse_date_from_filename(log)
         if file_date:
-            if oldest is None:
+            if oldest == None:
                 oldest = log
                 full_fp = os.path.join(CHRONY_STATS_DIR, oldest)
-            elif file_date < parse_date_from_filename(oldest):
-                oldest = log
-                full_fp = os.path.join(CHRONY_STATS_DIR, oldest)
+            else:
+                # We have to compare
+                if file_date < parse_date_from_filename(oldest):
+                    oldest = log
+                    full_fp = os.path.join(CHRONY_STATS_DIR, oldest)
     return full_fp
 
 def get_oldest_log_line_date():
-    """Find the oldest date within log files"""
+    """ Find the oldest log file and then find the oldest date recorded within """
     full_fp = get_oldest_log_file()
     oldest_date_found = None
     if full_fp:
-        try:
-            with open(full_fp) as f:
-                for line in f:
-                    try:
-                        if line.strip() and line.strip() != LOG_HEADER_BORDER and line.strip() != LOG_HEADER_COLUMNS.strip():
-                            split = line.split()
-                            if len(split) > 0:
-                                # Try to parse the date (first column)
-                                try:
-                                    log_line_date = datetime.strptime(split[0], '%Y-%m-%d')
-                                    if oldest_date_found is None or log_line_date < oldest_date_found:
-                                        oldest_date_found = log_line_date
-                                except ValueError:
-                                    # Not a date in expected format, skip
-                                    pass
-                    except Exception as inner_error:
-                        logger.debug(f"Error parsing line in log file: {inner_error}")
-                        continue
-        except Exception as error:
-            logger.error(f"Error reading log file {full_fp}: {error}")
-    
-    if not oldest_date_found:
-        # Fallback to 30 days ago if we couldn't find a date
-        oldest_date_found = datetime.now() - timedelta(days=30)
-        logger.warning(f"Could not determine oldest date, using fallback: {oldest_date_found}")
+        with open(full_fp) as f:
+            for line in f.readlines():
+                try:
+                    log_line_date = None
+                    if line != '' and line != '\n' and line.strip() != LOG_HEADER_BORDER and line.strip() != LOG_HEADER_COLUMNS.strip():
+                        split = line.split(' ')
+                        if len(split) > 0:
+                            log_line_date = datetime.strptime(split[0], '%Y-%m-%d')
+                        if oldest_date_found is None:
+                            # If first record found, save it as oldest
+                            oldest_date_found = log_line_date
+                        else:
+                            # We have two dates to compare, save the oldest
+                            if log_line_date is not None and log_line_date < oldest_date_found:
+                                oldest_date_found = log_line_date
+                except ValueError as error:
+                    logger.error(f"Error finding oldest date in log files: {error}")
+                    raise error
     else:
-        logger.info(f"Oldest date found in NTP statistics log: {oldest_date_found}")
-        
+        logger.error(f"No logs files to parse for oldest date on host {NODE_NAME}")
+    logger.info(f"Oldest date found in NTP statistics log on host {NODE_NAME}: [{oldest_date_found}] ")
     return oldest_date_found
 
-def run():
-    """Main execution with optimizations to reduce S3 API load"""
-    # Apply random jitter to spread out requests
-    apply_jitter()
+# Original run function - replaced by optimized version
+def run_original():
+    """ Parses necessary source logs and ships to s3 """
+    oldest_log_line_date = get_oldest_log_line_date()
+    default_target_date = datetime.now()
+    target_dates = []
+    today = datetime.today()
+    target_dates = [oldest_log_line_date + timedelta(days=x) for x in range((default_target_date-oldest_log_line_date).days)]
+    target_dates.append(today.date())
+    logger.info("Target dates: [{}]".format(target_dates))
     
-    # Determine date range to process
-    all_dates = get_date_range_to_process()
-    if not all_dates:
-        logger.warning("No dates to process, exiting")
-        return
-        
-    logger.info(f"Processing {len(all_dates)} days of logs from {all_dates[0]} to {all_dates[-1]}")
-    
-    # Start S3 client
+    # Start client, generate log, and ship
     client = start_client()
-    if not client:
-        logger.error("Failed to initialize S3 client")
-        return
+    
+    if client:
+        logger.info("Client started.")
+        log_keys = []
+        # Query s3 for logs relevant to this cluster-node for each target date
+        for date in target_dates:
+            formatted_date = datetime.strftime(date, '%Y-%m-%d')
+            log_keys.append(get_log_keys(client, formatted_date))
+        logger.debug("Log keys retrieved from s3: [{}]".format(log_keys))
         
-    # Process dates in batches
-    for date_batch in batch_dates(all_dates):
-        start_date = date_batch[0]
-        end_date = date_batch[-1]
+        if len(log_keys) == 0:
+            logger.info("No keys found.")
         
-        # Format dates for logging
-        start_str = start_date.strftime('%Y-%m-%d') if isinstance(start_date, datetime) else start_date
-        end_str = end_date.strftime('%Y-%m-%d') if isinstance(end_date, datetime) else end_date
+        united_s3_logs = get_united_s3_logs(client, log_keys)
+        host_logs_to_ship = get_deduped_host_logs(united_s3_logs)
         
-        logger.info(f"Processing batch from {start_str} to {end_str}")
+        # united_host_logs should be records from host that dont exist on s3
+        if host_logs_to_ship == "":
+            logger.info(f"{NODE_NAME} has no NTP stats logs to ship.")
+        else:
+            logger.info(f"{NODE_NAME} has logs to ship.")
+            logger.debug("Host logs to ship: [{}]".format(host_logs_to_ship))
         
-        # Get existing S3 logs for this date range
-        log_keys = get_log_keys_for_date_range(client, start_str, end_str)
-        
-        # Get content from S3 logs
-        s3_log_content = get_log_content_from_s3(client, log_keys)
-        
-        # Get new content from host logs (deduped against S3)
-        host_logs_to_ship = get_deduped_host_logs(s3_log_content)
-        
-        if not host_logs_to_ship:
-            logger.info(f"No new logs to ship for date range {start_str} to {end_str}")
-            continue
+        now = datetime.now().timestamp()
+        for date in target_dates:
+            formatted_date = datetime.strftime(date, '%Y-%m-%d')
+            output_fp = generate_archival_log(formatted_date, host_logs_to_ship)
             
-        # Generate archive log for the batch
-        output_fp = generate_archival_log(date_batch, host_logs_to_ship)
+            if output_fp:
+                upload_file_to_bucket(
+                    client,
+                    output_fp,
+                    BUCKET_NAME,
+                    NODE_NAME+'-'+formatted_date+'-'+str(now)
+                )
+    else:
+        logger.error("Error with s3 client.")
+        raise Exception("Client does not exist.")
+
+# New optimized run function
+def run():
+    """ Optimized version that reduces S3 API calls """
+    oldest_log_line_date = get_oldest_log_line_date()
+    default_target_date = datetime.now()
+    
+    # Optimization: Consider limiting the date range
+    days_difference = (default_target_date - oldest_log_line_date).days
+    
+    if days_difference > MAX_DAYS_BACK:
+        logger.info(f"Limiting processing to last {MAX_DAYS_BACK} days instead of {days_difference} days")
+        oldest_log_line_date = default_target_date - timedelta(days=MAX_DAYS_BACK)
+    
+    # Generate target dates
+    target_dates = [oldest_log_line_date + timedelta(days=x) for x in range((default_target_date-oldest_log_line_date).days)]
+    target_dates.append(default_target_date.date())
+    logger.info(f"Processing {len(target_dates)} target dates")
+    
+    # Start client
+    client = start_client()
+    
+    if client:
+        logger.info("Client started.")
         
-        if output_fp:
-            # Create a unique key with date range and timestamp
-            timestamp = int(datetime.now().timestamp())
-            s3_key = f"{get_s3_key_prefix()}/{start_str}_to_{end_str}_{timestamp}"
-            if USE_COMPRESSION:
-                s3_key += ".gz"
+        # Batch retrieve keys for all dates (fewer API calls)
+        all_keys = get_log_keys_batch(client, target_dates)
+        
+        # Get metadata instead of downloading all logs
+        existing_entries = get_log_metadata(client, all_keys)
+        
+        # More efficient deduplication
+        host_logs_to_ship = get_deduped_host_logs_efficient(existing_entries)
+        
+        if not host_logs_to_ship or host_logs_to_ship == LOG_HEADER.strip():
+            logger.info(f"{NODE_NAME} has no new NTP stats logs to ship.")
+        else:
+            logger.info(f"{NODE_NAME} has logs to ship.")
+            
+            # Process and upload logs
+            now = datetime.now().timestamp()
+            for date in target_dates:
+                formatted_date = datetime.strftime(date, '%Y-%m-%d')
+                output_fp = generate_archival_log(formatted_date, host_logs_to_ship)
                 
-            # Upload to S3
-            try:
-                upload_file_to_bucket(client, output_fp, BUCKET_NAME, s3_key)
-                # Clean up temp file
-                os.unlink(output_fp)
-            except Exception as error:
-                logger.error(f"Failed to upload batch {start_str} to {end_str}: {error}")
-                # Continue with next batch rather than failing entirely
-                continue
+                if output_fp:
+                    upload_file_to_bucket(
+                        client,
+                        output_fp,
+                        BUCKET_NAME,
+                        f"{NODE_NAME}-{formatted_date}-{now}"
+                    )
+    else:
+        logger.error("Error with s3 client.")
+        raise Exception("Client does not exist.")
 
 if __name__ == "__main__":
-    try:
-        run()
-    except Exception as e:
-        logger.error(f"Unhandled exception in main execution: {e}")
-        sys.exit(1)
+    # Set up logging
+    run()
