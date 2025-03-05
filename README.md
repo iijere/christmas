@@ -88,15 +88,24 @@ def parse_source_log(target_date, source_log_content):
 
 def save_log(log_content, target_date):
     """ Write content to tmpfs, then save """
-    tmp_file = tempfile.NamedTemporaryFile(prefix=NODE_NAME+target_date, suffix='.log')
+    # Use delete=False to prevent automatic deletion of the temporary file
+    tmp_file = tempfile.NamedTemporaryFile(prefix=NODE_NAME+target_date, suffix='.log', delete=False)
     try:
-        with open(tmp_file.name, "w+") as output_file:
+        # Close the file handle before reopening it in write mode to avoid issues on some platforms
+        tmp_file.close()
+        
+        with open(tmp_file.name, "w") as output_file:
             output_file.write(log_content)
-            output_file.seek(0)
-            output_file_name = output_file.name
-            logger.info("Data written to temporary file. It is ready to be shipped to s3 as file: [{}]".format(output_file_name))
-            return output_file_name
+        
+        output_file_name = tmp_file.name
+        logger.info("Data written to temporary file. It is ready to be shipped to s3 as file: [{}]".format(output_file_name))
+        return output_file_name
     except Exception as error:
+        # Clean up the file in case of error
+        try:
+            os.unlink(tmp_file.name)
+        except:
+            pass
         logger.error("Error saving log: [{}]".format(error))
         raise error
 
@@ -471,33 +480,58 @@ def run():
     if client:
         logger.info("Client started.")
         
-        # Batch retrieve keys for all dates (fewer API calls)
-        all_keys = get_log_keys_batch(client, target_dates)
-        
-        # Get metadata instead of downloading all logs
-        existing_entries = get_log_metadata(client, all_keys)
-        
-        # More efficient deduplication
-        host_logs_to_ship = get_deduped_host_logs_efficient(existing_entries)
-        
-        if not host_logs_to_ship or host_logs_to_ship == LOG_HEADER.strip():
-            logger.info(f"{NODE_NAME} has no new NTP stats logs to ship.")
-        else:
-            logger.info(f"{NODE_NAME} has logs to ship.")
+        try:
+            # Batch retrieve keys for all dates (fewer API calls)
+            all_keys = get_log_keys_batch(client, target_dates)
             
-            # Process and upload logs
-            now = datetime.now().timestamp()
-            for date in target_dates:
-                formatted_date = datetime.strftime(date, '%Y-%m-%d')
-                output_fp = generate_archival_log(formatted_date, host_logs_to_ship)
+            # Get metadata instead of downloading all logs
+            existing_entries = get_log_metadata(client, all_keys)
+            
+            # More efficient deduplication
+            host_logs_to_ship = get_deduped_host_logs_efficient(existing_entries)
+            
+            if not host_logs_to_ship or host_logs_to_ship == LOG_HEADER.strip():
+                logger.info(f"{NODE_NAME} has no new NTP stats logs to ship.")
+            else:
+                logger.info(f"{NODE_NAME} has logs to ship.")
                 
-                if output_fp:
-                    upload_file_to_bucket(
-                        client,
-                        output_fp,
-                        BUCKET_NAME,
-                        f"{NODE_NAME}-{formatted_date}-{now}"
-                    )
+                # Process and upload logs
+                now = datetime.now().timestamp()
+                temp_files = []  # Track temp files for cleanup
+                
+                for date in target_dates:
+                    formatted_date = datetime.strftime(date, '%Y-%m-%d')
+                    output_fp = generate_archival_log(formatted_date, host_logs_to_ship)
+                    
+                    if output_fp:
+                        temp_files.append(output_fp)
+                        try:
+                            # Verify file exists before upload
+                            if os.path.exists(output_fp):
+                                logger.info(f"Verified file exists: {output_fp}")
+                                upload_file_to_bucket(
+                                    client,
+                                    output_fp,
+                                    BUCKET_NAME,
+                                    f"{NODE_NAME}-{formatted_date}-{now}"
+                                )
+                            else:
+                                logger.error(f"File does not exist before upload attempt: {output_fp}")
+                        except Exception as upload_error:
+                            logger.error(f"Error uploading file {output_fp}: {upload_error}")
+                
+                # Clean up temporary files after all uploads complete
+                for temp_file in temp_files:
+                    try:
+                        if os.path.exists(temp_file):
+                            os.remove(temp_file)
+                            logger.debug(f"Removed temporary file: {temp_file}")
+                    except Exception as cleanup_error:
+                        logger.warning(f"Error removing temporary file {temp_file}: {cleanup_error}")
+                        
+        except Exception as e:
+            logger.error(f"Error in processing logs: {e}")
+            # Continue with execution rather than crashing
     else:
         logger.error("Error with s3 client.")
         raise Exception("Client does not exist.")
