@@ -220,19 +220,20 @@ def get_log_keys_batch(client, target_dates):
 # New function to efficiently get metadata
 def get_log_metadata(client, all_keys):
     """
-    Instead of downloading all logs, get metadata and track what we already have
-    Returns a set of unique log entry identifiers (date + IP + timestamp)
+    More thorough approach to identify existing log entries
+    Returns a set of unique log entry identifiers (date + time + IP)
     """
     existing_log_entries = set()
-    download_count = 0
-    max_downloads = 10  # Limit number of files to download for sampling
     
-    # Sample approach: only download a subset of files to determine patterns
+    # Track most recent timestamp for each IP address
+    latest_timestamps = {}
+    
+    # Process all keys for the current date to ensure complete deduplication
     for date, keys in all_keys.items():
-        for key in keys:
-            if download_count >= max_downloads:
-                break
-                
+        # Sort keys by timestamp to process them in chronological order
+        sorted_keys = sorted(keys)
+        
+        for key in sorted_keys:
             try:
                 log_s3_response = client.get_object(Bucket=BUCKET_NAME, Key=key)
                 log_content = log_s3_response.get("Body").read().decode('utf-8')
@@ -240,20 +241,35 @@ def get_log_metadata(client, all_keys):
                 # Extract unique identifiers from each log line
                 for line in log_content.splitlines():
                     if line and not line.startswith('=') and "IP Address" not in line:
-                        # Parse the line to get a unique identifier
+                        # Parse the line to get date, time, and IP
                         parts = line.split()
                         if len(parts) >= 3:
-                            # Use date + time + IP as unique identifier
-                            entry_id = f"{parts[0]}_{parts[1]}_{parts[2]}"
+                            date_str = parts[0]
+                            time_str = parts[1]
+                            ip_str = parts[2]
+                            
+                            # Create a unique entry ID
+                            entry_id = f"{date_str}_{time_str}_{ip_str}"
                             existing_log_entries.add(entry_id)
+                            
+                            # Track latest timestamp for each IP
+                            timestamp = f"{date_str} {time_str}"
+                            if ip_str not in latest_timestamps or timestamp > latest_timestamps[ip_str]:
+                                latest_timestamps[ip_str] = timestamp
                 
-                download_count += 1
             except Exception as error:
-                logger.error(f"Error processing S3 log {key}: {error}")
+                logger.warning(f"Error processing S3 log {key}: {error}")
                 continue
     
-    logger.info(f"Identified {len(existing_log_entries)} unique log entries from {download_count} sample files")
-    return existing_log_entries
+    logger.info(f"Identified {len(existing_log_entries)} unique log entries from S3")
+    
+    # Store latest timestamps for use in filtering
+    with tempfile.NamedTemporaryFile(mode='w', delete=False, prefix='latest_timestamps_', suffix='.json') as f:
+        json.dump(latest_timestamps, f)
+        timestamp_file = f.name
+        
+    logger.info(f"Saved latest timestamps to {timestamp_file}")
+    return existing_log_entries, timestamp_file
 
 # Original function - will be replaced
 def get_united_s3_logs(client, log_keys):
@@ -287,16 +303,24 @@ def get_deduped_host_logs(united_s3_logs):
     return united_host_logs
 
 # New optimized function for deduplication
-def get_deduped_host_logs_efficient(existing_entries):
+def get_deduped_host_logs_efficient(existing_entries, timestamp_file):
     """
-    More efficient deduplication using set operations instead of string contains
+    More efficient deduplication that also considers timestamps
+    Only includes entries newer than what's already in S3
     """
     deduped_logs = []
     entry_count = 0
     duplicate_count = 0
+    timestamp_filtered = 0
     
     # Add header to output
     deduped_logs.append(LOG_HEADER.strip())
+    
+    # Load the latest timestamps for each IP
+    with open(timestamp_file, 'r') as f:
+        latest_timestamps = json.load(f)
+    
+    logger.info(f"Loaded latest timestamps for {len(latest_timestamps)} IPs")
     
     for fp in os.listdir(CHRONY_STATS_DIR):
         full_fp = os.path.join(CHRONY_STATS_DIR, fp)
@@ -306,16 +330,36 @@ def get_deduped_host_logs_efficient(existing_entries):
                 if line.strip() and not line.startswith('=') and "IP Address" not in line:
                     parts = line.split()
                     if len(parts) >= 3:
-                        entry_id = f"{parts[0]}_{parts[1]}_{parts[2]}"
+                        date_str = parts[0]
+                        time_str = parts[1]
+                        ip_str = parts[2]
+                        
+                        entry_id = f"{date_str}_{time_str}_{ip_str}"
                         entry_count += 1
                         
-                        # If entry not in our existing set, add it to output
-                        if entry_id not in existing_entries:
-                            deduped_logs.append(line.strip())
-                        else:
+                        # Check if this entry is newer than the latest timestamp for this IP
+                        current_timestamp = f"{date_str} {time_str}"
+                        
+                        # Skip if we've seen this exact entry before
+                        if entry_id in existing_entries:
                             duplicate_count += 1
+                            continue
+                            
+                        # Skip if this entry is older than or equal to the latest we've seen for this IP
+                        if ip_str in latest_timestamps and current_timestamp <= latest_timestamps[ip_str]:
+                            timestamp_filtered += 1
+                            continue
+                            
+                        # If we get here, this is a new entry we should include
+                        deduped_logs.append(line.strip())
     
-    logger.info(f"Processed {entry_count} log entries, found {duplicate_count} duplicates")
+    # Clean up the timestamp file
+    try:
+        os.remove(timestamp_file)
+    except:
+        pass
+        
+    logger.info(f"Processed {entry_count} log entries, found {duplicate_count} exact duplicates and {timestamp_filtered} older entries")
     return '\n'.join(deduped_logs)
 
 def parse_date_from_filename(filename):
@@ -458,7 +502,7 @@ def run_original():
 
 # New optimized run function
 def run():
-    """ Optimized version that reduces S3 API calls """
+    """ Optimized version that reduces S3 API calls and ensures no duplicates """
     oldest_log_line_date = get_oldest_log_line_date()
     default_target_date = datetime.now()
     
@@ -481,44 +525,52 @@ def run():
         logger.info("Client started.")
         
         try:
-            # Batch retrieve keys for all dates (fewer API calls)
+            # Process today only to reduce API load (most important for daily runs)
+            today = datetime.now().date()
+            today_str = today.strftime('%Y-%m-%d')
+            
+            # Get keys for all dates we'll need to deduplicate against
+            logger.info("Retrieving existing log keys for deduplication...")
             all_keys = get_log_keys_batch(client, target_dates)
             
-            # Get metadata instead of downloading all logs
-            existing_entries = get_log_metadata(client, all_keys)
+            # Get comprehensive metadata to ensure proper deduplication
+            logger.info("Building comprehensive deduplication database...")
+            existing_entries, timestamp_file = get_log_metadata(client, all_keys)
             
-            # More efficient deduplication
-            host_logs_to_ship = get_deduped_host_logs_efficient(existing_entries)
+            # More efficient deduplication with timestamp filtering
+            logger.info("Performing deduplicated host log extraction...")
+            host_logs_to_ship = get_deduped_host_logs_efficient(existing_entries, timestamp_file)
             
             if not host_logs_to_ship or host_logs_to_ship == LOG_HEADER.strip():
                 logger.info(f"{NODE_NAME} has no new NTP stats logs to ship.")
             else:
-                logger.info(f"{NODE_NAME} has logs to ship.")
+                logger.info(f"{NODE_NAME} has new logs to ship.")
                 
                 # Process and upload logs
                 now = datetime.now().timestamp()
                 temp_files = []  # Track temp files for cleanup
                 
-                for date in target_dates:
-                    formatted_date = datetime.strftime(date, '%Y-%m-%d')
-                    output_fp = generate_archival_log(formatted_date, host_logs_to_ship)
-                    
-                    if output_fp:
-                        temp_files.append(output_fp)
-                        try:
-                            # Verify file exists before upload
-                            if os.path.exists(output_fp):
-                                logger.info(f"Verified file exists: {output_fp}")
-                                upload_file_to_bucket(
-                                    client,
-                                    output_fp,
-                                    BUCKET_NAME,
-                                    f"{NODE_NAME}-{formatted_date}-{now}"
-                                )
-                            else:
-                                logger.error(f"File does not exist before upload attempt: {output_fp}")
-                        except Exception as upload_error:
-                            logger.error(f"Error uploading file {output_fp}: {upload_error}")
+                # Only process today to avoid duplicates with historical data
+                # This is more conservative - we're only uploading today's logs
+                formatted_date = today_str
+                output_fp = generate_archival_log(formatted_date, host_logs_to_ship)
+                
+                if output_fp:
+                    temp_files.append(output_fp)
+                    try:
+                        # Verify file exists before upload
+                        if os.path.exists(output_fp):
+                            logger.info(f"Verified file exists: {output_fp}")
+                            upload_file_to_bucket(
+                                client,
+                                output_fp,
+                                BUCKET_NAME,
+                                f"{NODE_NAME}-{formatted_date}-{now}"
+                            )
+                        else:
+                            logger.error(f"File does not exist before upload attempt: {output_fp}")
+                    except Exception as upload_error:
+                        logger.error(f"Error uploading file {output_fp}: {upload_error}")
                 
                 # Clean up temporary files after all uploads complete
                 for temp_file in temp_files:
