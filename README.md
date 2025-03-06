@@ -1,4 +1,9 @@
-#!/usr/bin/env python
+CHRONY_STATS_DIR = os.environ.get("CHRONY_STATS_DIR", "/host/var/log/chrony")
+NODE_NAME = os.environ.get("NODE_NAME", "")
+S3_ENDPOINT = os.environ.get("S3_ENDPOINT_URL", "")
+S3_SECRET_SECRET_KEY = os.environ.get("S3_SECRET_SECRET_KEY", "")
+S3_SECRET_ACCESS_KEY = os.environ.get("S3_SECRET_ACCESS_KEY", "")
+BUCKET_NAME = os.environ.get("BUCKET_NAME", "")#!/usr/bin/env python
 # This script is run on MKS Nodes, parses log files in
 # /var/log/chrony/ up until the oldest date found
 # and exports the data to a s3 bucket for FINRA compliance.
@@ -29,12 +34,12 @@ import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
 
-CHRONY_STATS_DIR = os.environ.get("CHRONY_STATS_DIR", "/host/var/log/chrony")
-NODE_NAME = os.environ.get("NODE_NAME", "")
-S3_ENDPOINT = os.environ.get("S3_ENDPOINT_URL", "")
-S3_SECRET_SECRET_KEY = os.environ.get("S3_SECRET_SECRET_KEY", "")
-S3_SECRET_ACCESS_KEY = os.environ.get("S3_SECRET_ACCESS_KEY", "")
-BUCKET_NAME = os.environ.get("BUCKET_NAME", "")
+# Default lookback period for deduplication (must be sufficient for compliance)
+# FINRA requires pushing logs every 30 minutes, so we need sufficient lookback
+DEFAULT_LOOKBACK_DAYS = int(os.environ.get("MAX_LOOKBACK_DAYS", "3"))  # Default to 3 days
+# Maximum number of logs to download per day for deduplication
+MAX_LOGS_PER_DAY = int(os.environ.get("MAX_LOGS_PER_DAY", "5"))  # Default to 5 most recent logs per day
+# Maximum historical logs to process (for complete history if needed)
 MAX_DAYS_BACK = int(os.environ.get("MAX_DAYS_BACK", "30"))  # Default to 30 days
 
 LOG_HEADER_BORDER = "======================================================================================================"
@@ -220,23 +225,33 @@ def get_log_keys_batch(client, target_dates):
 # New function to efficiently get metadata
 def get_log_metadata(client, all_keys):
     """
-    More thorough approach to identify existing log entries
-    Returns a set of unique log entry identifiers (date + time + IP)
+    Optimized approach to identify existing log entries with minimal S3 API calls
+    Only downloads most recent logs for each day
     """
     existing_log_entries = set()
+    total_downloads = 0
     
     # Track most recent timestamp for each IP address
     latest_timestamps = {}
     
-    # Process all keys for the current date to ensure complete deduplication
+    # Build a map of date -> list of sorted keys (most recent first)
+    organized_keys = {}
     for date, keys in all_keys.items():
-        # Sort keys by timestamp to process them in chronological order
-        sorted_keys = sorted(keys)
+        # Sort keys by timestamp (descending) - most recent first
+        # Key format: NODE_NAME-DATE-TIMESTAMP
+        organized_keys[date] = sorted(keys, reverse=True)
+    
+    # Process only a limited number of most recent logs for each date
+    for date, sorted_keys in organized_keys.items():
+        # Only process most recent X logs per day
+        logs_to_process = sorted_keys[:MAX_LOGS_PER_DAY]
+        logger.info(f"Processing {len(logs_to_process)} most recent logs for {date} out of {len(sorted_keys)} total")
         
-        for key in sorted_keys:
+        for key in logs_to_process:
             try:
                 log_s3_response = client.get_object(Bucket=BUCKET_NAME, Key=key)
                 log_content = log_s3_response.get("Body").read().decode('utf-8')
+                total_downloads += 1
                 
                 # Extract unique identifiers from each log line
                 for line in log_content.splitlines():
@@ -261,14 +276,14 @@ def get_log_metadata(client, all_keys):
                 logger.warning(f"Error processing S3 log {key}: {error}")
                 continue
     
-    logger.info(f"Identified {len(existing_log_entries)} unique log entries from S3")
+    logger.info(f"Identified {len(existing_log_entries)} unique log entries from {total_downloads} S3 log files")
+    logger.info(f"Tracking latest timestamps for {len(latest_timestamps)} IP addresses")
     
     # Store latest timestamps for use in filtering
     with tempfile.NamedTemporaryFile(mode='w', delete=False, prefix='latest_timestamps_', suffix='.json') as f:
         json.dump(latest_timestamps, f)
         timestamp_file = f.name
         
-    logger.info(f"Saved latest timestamps to {timestamp_file}")
     return existing_log_entries, timestamp_file
 
 # Original function - will be replaced
@@ -502,21 +517,22 @@ def run_original():
 
 # New optimized run function
 def run():
-    """ Optimized version that reduces S3 API calls and ensures no duplicates """
+    """ Optimized version that minimizes S3 API calls while ensuring proper deduplication """
     oldest_log_line_date = get_oldest_log_line_date()
     default_target_date = datetime.now()
     
-    # Optimization: Consider limiting the date range
-    days_difference = (default_target_date - oldest_log_line_date).days
+    # Drastically reduce date range for S3 lookups to minimize API calls
+    max_lookback_days = int(os.environ.get("MAX_LOOKBACK_DAYS", "7"))  # Default to 7 days for deduplication
+    lookback_date = default_target_date - timedelta(days=max_lookback_days)
     
-    if days_difference > MAX_DAYS_BACK:
-        logger.info(f"Limiting processing to last {MAX_DAYS_BACK} days instead of {days_difference} days")
+    # Use a longer date range only for logging and context
+    if days_difference := (default_target_date - oldest_log_line_date).days > MAX_DAYS_BACK:
+        logger.info(f"Limiting processing to last {MAX_DAYS_BACK} days instead of {days_difference} days for context")
         oldest_log_line_date = default_target_date - timedelta(days=MAX_DAYS_BACK)
     
-    # Generate target dates
-    target_dates = [oldest_log_line_date + timedelta(days=x) for x in range((default_target_date-oldest_log_line_date).days)]
-    target_dates.append(default_target_date.date())
-    logger.info(f"Processing {len(target_dates)} target dates")
+    # Generate target dates - use limited range for S3 lookup to minimize API calls
+    dedup_dates = [(lookback_date + timedelta(days=x)).date() for x in range(max_lookback_days + 1)]
+    logger.info(f"Will check S3 logs from the past {max_lookback_days} days for deduplication")
     
     # Start client
     client = start_client()
@@ -525,16 +541,12 @@ def run():
         logger.info("Client started.")
         
         try:
-            # Process today only to reduce API load (most important for daily runs)
-            today = datetime.now().date()
-            today_str = today.strftime('%Y-%m-%d')
+            # Only retrieve keys for a limited date range to reduce API calls
+            logger.info(f"Retrieving log keys for only the past {max_lookback_days} days...")
+            all_keys = get_log_keys_batch(client, dedup_dates)
             
-            # Get keys for all dates we'll need to deduplicate against
-            logger.info("Retrieving existing log keys for deduplication...")
-            all_keys = get_log_keys_batch(client, target_dates)
-            
-            # Get comprehensive metadata to ensure proper deduplication
-            logger.info("Building comprehensive deduplication database...")
+            # Get metadata with limited lookback to ensure minimal S3 API calls
+            logger.info("Building deduplication database with minimal S3 downloads...")
             existing_entries, timestamp_file = get_log_metadata(client, all_keys)
             
             # More efficient deduplication with timestamp filtering
@@ -551,8 +563,8 @@ def run():
                 temp_files = []  # Track temp files for cleanup
                 
                 # Only process today to avoid duplicates with historical data
-                # This is more conservative - we're only uploading today's logs
-                formatted_date = today_str
+                today = datetime.now().date()
+                formatted_date = today.strftime('%Y-%m-%d')
                 output_fp = generate_archival_log(formatted_date, host_logs_to_ship)
                 
                 if output_fp:
